@@ -1049,11 +1049,19 @@ impl VM {
 
                 let result = U256::from(self.memory.read(i, 32).as_slice());
 
+                // simplify input: if the input operation is MLOAD(0x40), replace with actual offset value
+                let simplified_operation = if operation.solidify() == "memory[0x40]" {
+                    // set the actual offset value to the stack as a PUSH instruction
+                    WrappedOpcode::new(0x60, vec![WrappedInput::Raw(result)])
+                } else {
+                    operation
+                };
+
                 // consume dynamic gas
                 let gas_cost = self.memory.expansion_cost(i, 32);
                 self.consume_gas(gas_cost);
 
-                self.stack.push(result, operation);
+                self.stack.push(result, simplified_operation);
             }
 
             // MSTORE
@@ -2098,6 +2106,35 @@ mod tests {
 
         assert_eq!(vm.stack.peek(1).value, U256::from_str("0xff").expect("failed to parse hex"));
         assert_eq!(vm.stack.peek(0).value, U256::from_str("0xff00").expect("failed to parse hex"));
+    }
+
+    #[test]
+    fn test_mload_mstore_free_mem_ptr() {
+        // 1. init free memory pointer to 0x80: 6080604052
+        // - mstore(0x40, 0x80)
+        // 2. load free memory pointer from 0x40: 604051
+        // - mload(0x40) -> 0x80
+        // - stack: [0x80]
+        // 3. update free memory pointer: 0x80 + 0xa0 = 0x120: 8060a001604052604051
+        // - mstore(0x40, mload(0x40) + 0xa0)
+        // - mload(0x40) -> 0x120
+        // - stack: [0x120, 0x80]
+        // 4. load memory[0x80 + 0x20]: 8160200151
+        // - mload(0x80 + 0x20) -> 0x0
+        // - stack: [0x0, 0x120, 0x80]
+        let mut vm = new_test_vm("0x60806040526040518060a0016040526040518160200151");
+        vm.execute().expect("execution failed!");
+
+        let first_item = vm.stack.peek(0);
+        assert_eq!(first_item.value, U256::from_str("0x0").expect("failed to parse hex"));
+        assert_eq!(first_item.operation.opcode.code, 0x51);
+        assert_eq!(first_item.operation.solidify(), "memory[0xa0]");
+        let second_item = vm.stack.peek(1);
+        assert_eq!(second_item.value, U256::from_str("0x120").expect("failed to parse hex"));
+        assert_eq!(second_item.operation.solidify(), "0x0120");
+        let third_item = vm.stack.peek(2);
+        assert_eq!(third_item.value, U256::from_str("0x80").expect("failed to parse hex"));
+        assert_eq!(third_item.operation.solidify(), "0x80");
     }
 
     #[test]
