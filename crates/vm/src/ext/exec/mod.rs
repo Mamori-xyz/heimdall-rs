@@ -97,7 +97,7 @@ impl VM {
         while vm.bytecode.len() >= vm.instruction as usize {
             // if we have reached the timeout, return None
             if Instant::now() >= *timeout_at {
-                return Ok(vm_trace);
+                return Ok(Some(vm_trace));
             }
 
             // execute the next instruction. if the instruction panics, invalidate this path
@@ -131,24 +131,24 @@ impl VM {
 
                 // if the stack contains too many items, it's probably a loop
                 if stack_contains_too_many_items(&vm.stack) {
-                    return Ok(vm_trace);
+                    return Ok(Some(vm_trace));
                 }
 
                 // if the stack has over 16 items of the same source, it's probably a loop
                 if stack_contains_too_many_of_the_same_item(&vm.stack) {
-                    return Ok(vm_trace);
+                    return Ok(Some(vm_trace));
                 }
 
                 // if any item on the stack has a depth > 16, it's probably a loop (because of stack
                 // too deep)
                 if stack_item_source_depth_too_deep(&vm.stack) {
-                    return Ok(vm_trace);
+                    return Ok(Some(vm_trace));
                 }
 
                 // if the jump stack depth is less than the max stack depth of all previous matching
                 // jumps, it's probably a loop
                 if jump_stack_depth_less_than_max_stack_depth(&jump_frame, handled_jumps) {
-                    return Ok(vm_trace);
+                    return Ok(Some(vm_trace));
                 }
 
                 // perform heuristic checks on historical stacks
@@ -213,7 +213,7 @@ impl VM {
 
                             // this key exists, but the stack is different, so the jump is new
                             historical_stacks.push(vm.stack.clone());
-                            return Ok(vm_trace);
+                            return Ok(Some(vm_trace));
                         }
 
                         if historical_diffs_approximately_equal(&vm.stack, historical_stacks) {
@@ -226,7 +226,7 @@ impl VM {
 
                             // this key exists, but the stack is different, so the jump is new
                             historical_stacks.push(vm.stack.clone());
-                            return Ok(vm_trace);
+                            return Ok(Some(vm_trace));
                         } else {
                             trace!(
                                 "adding historical stack {} to jump frame {:?}",
@@ -273,7 +273,7 @@ impl VM {
                         Ok(None) => {}
                         Err(e) => {
                             warn!("error executing branch: {:?}", e);
-                            return Ok(vm_trace);
+                            return Ok(Some(vm_trace));
                         }
                     }
 
@@ -283,7 +283,7 @@ impl VM {
                         Ok(None) => {}
                         Err(e) => {
                             warn!("error executing branch: {:?}", e);
-                            return Ok(vm_trace);
+                            return Ok(Some(vm_trace));
                         }
                     }
                     break;
@@ -296,7 +296,7 @@ impl VM {
                         Ok(None) => {}
                         Err(e) => {
                             warn!("error executing branch: {:?}", e);
-                            return Ok(vm_trace);
+                            return Ok(Some(vm_trace));
                         }
                     }
 
@@ -306,7 +306,7 @@ impl VM {
                         Ok(None) => {}
                         Err(e) => {
                             warn!("error executing branch: {:?}", e);
-                            return Ok(vm_trace);
+                            return Ok(Some(vm_trace));
                         }
                     }
                     break;
