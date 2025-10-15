@@ -130,26 +130,26 @@ impl VM {
                 );
 
                 // if the stack contains too many items, it's probably a loop
-                if stack_contains_too_many_items(&vm.stack) {
-                    return Ok(Some(vm_trace));
-                }
+                // if stack_contains_too_many_items(&vm.stack) {
+                //     return Ok(Some(vm_trace));
+                // }
 
                 // if the stack has over 16 items of the same source, it's probably a loop
-                if stack_contains_too_many_of_the_same_item(&vm.stack) {
-                    return Ok(Some(vm_trace));
-                }
+                // if stack_contains_too_many_of_the_same_item(&vm.stack) {
+                //     return Ok(Some(vm_trace));
+                // }
 
                 // if any item on the stack has a depth > 16, it's probably a loop (because of stack
                 // too deep)
-                if stack_item_source_depth_too_deep(&vm.stack) {
-                    return Ok(Some(vm_trace));
-                }
+                // if stack_item_source_depth_too_deep(&vm.stack) {
+                //     return Ok(Some(vm_trace));
+                // }
 
                 // if the jump stack depth is less than the max stack depth of all previous matching
                 // jumps, it's probably a loop
-                if jump_stack_depth_less_than_max_stack_depth(&jump_frame, handled_jumps) {
-                    return Ok(Some(vm_trace));
-                }
+                // if jump_stack_depth_less_than_max_stack_depth(&jump_frame, handled_jumps) {
+                //     return Ok(Some(vm_trace));
+                // }
 
                 // perform heuristic checks on historical stacks
                 match handled_jumps.get_mut(&jump_frame) {
