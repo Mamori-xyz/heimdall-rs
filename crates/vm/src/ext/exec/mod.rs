@@ -153,26 +153,12 @@ impl VM {
                 U256::from(0)
             };
 
-            let state = self.step()?;
-            // log1
-            if state.last_instruction.opcode == 0xa1 {                            
-                if log_value < U256::from(1000000000000000000u128) {
-                    println!("log1: {:#x}", log_value);
-                }
-            } else if state.last_instruction.opcode == 0x1b {
-                // println!("shft! left: {} -> {}", shl_value, state.last_instruction.instruction);
-            } else if state.last_instruction.opcode == 0xfd {
-                // println!("revert: {}", revert_value);
-            } else if state.last_instruction.opcode == 0xf3 || state.last_instruction.opcode == 0x00 {
-                println!("reached exit code or returndata");     
-            }
-
+            let state = self.step()?;            
             let last_instruction = state.last_instruction.clone();
             root_trace.operations.push(state);
             root_trace.gas_used = self.gas_used;    
 
-            if self.exitcode != 255 || !self.returndata.is_empty() {        
-                // println!("reached exit code or returndata");     
+            if self.exitcode != 255 || !self.returndata.is_empty() {                        
                 break;
             }
 
@@ -233,8 +219,7 @@ impl VM {
         }
 
         // process the queue until it is empty
-        while !queue.is_empty() {     
-            // println!("queue size: {}", queue.len());       
+        while !queue.is_empty() {            
             let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
             let (trace, mut next_traces) = vm.build_trace()?;
             // validate with loop detection heuristics. if the trace is a loop, skip it
