@@ -469,8 +469,7 @@ impl VM {
                     return Ok(None);
                 }
             }            
-
-            println!("queue size: {}", queue.len());
+            
             let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
             let (trace, mut next_traces) = vm.build_trace()?;
             // validate with loop detection heuristics. if the trace is a loop, skip it
