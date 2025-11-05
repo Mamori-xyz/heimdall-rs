@@ -372,6 +372,7 @@ impl VM {
         pc_n_opcode
     }
 
+    // build a trace from current instruction and return the next traces to explore
     fn build_trace(&mut self) -> Result<(VMTrace, Vec<VM>)> {
         let mut root_trace = VMTrace {
             instruction: self.instruction,
@@ -421,7 +422,17 @@ impl VM {
         Ok((root_trace, next_traces))
     }
 
-    pub fn build_all_traces(&mut self, branch_limit: Option<u32>, segment_limit: Option<u32>, simple_cfg: bool) -> Result<Option<VMTrace>> {         
+    // build all traces from the current instruction according to the branch, segment, and loop limits
+    // - The branch limit is the maximum number of branches to explore. If not provided, it will be ignored.
+    // - The segment limit is the maximum number of segments to explore. If not provided, it will be ignored.
+    // - The loop limit is the maximum number of times a segment can appear in the branch. If not provided, it will be set to 1.
+    // - If simple_cfg is true, we will only process each similar trace once by checking globally and ignore the branch and segment limits.
+    // - When return None, it means we have reached the branch or segment limits.
+    pub fn build_all_traces(&mut self,
+        branch_limit: Option<u32>,
+        segment_limit: Option<u32>,
+        loop_limit: Option<u32>,
+        simple_cfg: bool) -> Result<Option<VMTrace>> {         
         let mut branch_count: u32 = 0;
         let mut segment_count: u32 = 0;
 
@@ -438,8 +449,8 @@ impl VM {
             &root_trace.operations.first().ok_or_eyre("no operations")?.stack);
 
         // init the root trace    
-        let mut previous_trace_hash = HashSet::new();
-        previous_trace_hash.insert(root_trace_hash);  
+        let mut previous_trace_hash = HashMap::new();
+        previous_trace_hash.insert(root_trace_hash, 1);  
 
         // update the branch and segment counts for the root trace
         branch_count += 1;
@@ -451,7 +462,7 @@ impl VM {
         parent_to_children.entry(node_counter).or_insert(HashSet::new());
 
         // initialize the queue with the first set of traces
-        let mut queue: VecDeque<(u32, HashSet<U256>, VM)> = VecDeque::new();
+        let mut queue: VecDeque<(u32, HashMap<U256, u32>, VM)> = VecDeque::new();
         while !next_traces.is_empty() {        
             queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
         }
@@ -479,9 +490,9 @@ impl VM {
                 &trace.operations.first().ok_or_eyre("no operations")?.stack);
 
             // loop detection
-            if !previous_trace_hash.contains(&current_trace_hash) {
-                previous_trace_hash.insert(current_trace_hash);
-            } else {
+            *previous_trace_hash.entry(current_trace_hash).or_insert(0) += 1;
+            let loop_limit = loop_limit.unwrap_or(1);
+            if *previous_trace_hash.get(&current_trace_hash).ok_or_eyre("no current trace hash")? > loop_limit {
                 continue;
             }
 
@@ -537,7 +548,7 @@ impl VM {
                 // if this is the root trace, set it
                 root_trace = Some(trace);
             }
-        }
+        }        
 
         Ok(Some(root_trace.ok_or_eyre("no root trace")?))
     }
@@ -548,6 +559,7 @@ impl VM {
         entry_point: u128,        
         branch_limit: Option<u32>,
         segment_limit: Option<u32>,
+        loop_limit: Option<u32>,
         simple_cfg: bool,
     ) -> Result<Option<VMTrace>> {
         self.calldata = decode_hex(selector)?;
@@ -563,7 +575,7 @@ impl VM {
             }
         }
         
-        self.build_all_traces(branch_limit, segment_limit, simple_cfg)
+        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg)
     }
 }
 
