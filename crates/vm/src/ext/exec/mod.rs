@@ -387,19 +387,20 @@ impl VM {
             root_trace.operations.push(state);
             root_trace.gas_used = self.gas_used;    
 
-            if self.exitcode != 255 || !self.returndata.is_empty() {                        
+            if self.exitcode != 255 || !self.returndata.is_empty() {                
                 break;
             }
 
             // jump / jumpi
             if last_instruction.opcode == 0x57 || last_instruction.opcode == 0x56 {
                 if last_instruction.opcode == 0x57 {
+                    // continue branch
                     let mut new_trace = self.clone();
                     new_trace.instruction = last_instruction.instruction + 1;
                     next_traces.push(new_trace);
                 }
 
-
+                // jump branch
                 let mut new_trace = self.clone();
                 new_trace.instruction = last_instruction.inputs[0].as_u128() + 1;
                 next_traces.push(new_trace);
@@ -420,7 +421,10 @@ impl VM {
         Ok((root_trace, next_traces))
     }
 
-    pub fn build_all_traces(&mut self) -> Result<VMTrace> {     
+    pub fn build_all_traces(&mut self, branch_limit: Option<u32>, segment_limit: Option<u32>, simple_cfg: bool) -> Result<Option<VMTrace>> {         
+        let mut branch_count: u32 = 0;
+        let mut segment_count: u32 = 0;
+
         let jumpdest_pc = Self::program_counter(self.bytecode.clone())
             .iter()
             .filter(|(k, v)| v.code == 0x5b)
@@ -432,11 +436,19 @@ impl VM {
         let root_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
             root_trace.operations.first().ok_or_eyre("no operations")?.last_instruction.instruction, 
             &root_trace.operations.first().ok_or_eyre("no operations")?.stack);
+
+        // init the root trace    
         let mut previous_trace_hash = HashSet::new();
-        previous_trace_hash.insert(root_trace_hash);        
+        previous_trace_hash.insert(root_trace_hash);  
+
+        // update the branch and segment counts for the root trace
+        branch_count += 1;
+        segment_count += 1;
 
         let mut parent_to_children: HashMap<u32, HashSet<u32>> = HashMap::new();
         let mut node_id_to_parent_map: HashMap<u32, (Option<u32>, VMTrace)> = HashMap::new();             
+        node_id_to_parent_map.insert(node_counter, (None, root_trace));
+        parent_to_children.entry(node_counter).or_insert(HashSet::new());
 
         // initialize the queue with the first set of traces
         let mut queue: VecDeque<(u32, HashSet<U256>, VM)> = VecDeque::new();
@@ -444,8 +456,21 @@ impl VM {
             queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
         }
 
+        // only used for simple cfg
+        let mut processed_nodes = HashSet::new();  
         // process the queue until it is empty
-        while !queue.is_empty() {            
+        while !queue.is_empty() {   
+            // only check branch and segment limits if we are not building a simple cfg
+            if !simple_cfg {
+                if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
+                    return Ok(None);
+                }
+                if segment_limit.is_some() && segment_count >= segment_limit.unwrap() {
+                    return Ok(None);
+                }
+            }            
+
+            println!("queue size: {}", queue.len());
             let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
             let (trace, mut next_traces) = vm.build_trace()?;
             // validate with loop detection heuristics. if the trace is a loop, skip it
@@ -454,12 +479,26 @@ impl VM {
                 current_first_pc, 
                 &trace.operations.first().ok_or_eyre("no operations")?.stack);
 
+            // loop detection
             if !previous_trace_hash.contains(&current_trace_hash) {
                 previous_trace_hash.insert(current_trace_hash);
             } else {
                 continue;
-            }        
+            }
 
+            // if we are building a simple cfg, we only want to process each similar trace once by checking globally
+            if simple_cfg {     
+                if !processed_nodes.contains(&current_trace_hash) {
+                    processed_nodes.insert(current_trace_hash);
+                } else {
+                    continue;
+                }
+            }   
+
+            if next_traces.len() > 1 {
+                branch_count += 1;
+            }
+            segment_count += 1;
             node_counter += 1;        
             node_id_to_parent_map.insert(node_counter, (Some(parent_id), trace));                  
             parent_to_children.entry(parent_id).or_insert(HashSet::new()).insert(node_counter);
@@ -467,7 +506,7 @@ impl VM {
             while !next_traces.is_empty() {                
                 queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
             }
-        }
+        }        
 
         // always start with the nodes that have no children
         let mut ids = parent_to_children.iter().filter_map(|(parent_id, children)| {
@@ -479,45 +518,39 @@ impl VM {
         }).collect::<Vec<u32>>();
 
         let mut root_trace: Option<VMTrace> = None;
-        while !ids.is_empty() {
+        while !ids.is_empty() {            
             let id = ids.pop().ok_or_eyre("no ids")?;            
             // remove parent from the parent_to_children map
-            parent_to_children.remove(&id).ok_or_eyre("no such id")?;
-            // remove children from the parent_to_children map
-            parent_to_children.iter_mut().for_each(|(_, children)| {
-                children.remove(&id);
-            });
+            parent_to_children.remove(&id).ok_or_eyre("no such id")?;            
 
-            // because we are building with nodes that have no children, we can safely remove the current trace from the node_id_to_parent_map
-            let (parent_id, trace) = node_id_to_parent_map.remove(&id).ok_or_eyre("no such id")?;
+            // because we are building with nodes that have no children, we can safely remove the current trace from the node_id_to_parent_map            
+            let (parent_id, trace) = node_id_to_parent_map.remove(&id).ok_or_eyre("no such id")?;            
             if let Some(parent_id) = parent_id {
-                // becase we start nodes with no children, so we don't expect the parent to be not found.
-                node_id_to_parent_map.get_mut(&parent_id).ok_or_eyre("no parent id")?.1.children.push(trace.clone());
+                // remove child from parent
+                parent_to_children.get_mut(&parent_id).ok_or_eyre("no parent id")?.remove(&id);
+                // if the parent has no children, add it to the ids list
+                if parent_to_children.get(&parent_id).ok_or_eyre("no parent id")?.len() == 0 {
+                    ids.push(parent_id);
+                }
+                // becase we start nodes with no children, so we don't expect the parent to be not found.                
+                node_id_to_parent_map.get_mut(&parent_id).ok_or_eyre("no parent id")?.1.children.push(trace);                
             } else {
                 // if this is the root trace, set it
                 root_trace = Some(trace);
             }
-
-            if ids.is_empty() {
-                // if there are no more nodes with no children, get the next set of nodes that have no children
-                ids = parent_to_children.iter().filter_map(|(parent_id, children)| {
-                    if children.is_empty() {
-                        Some(*parent_id)
-                    } else {
-                        None
-                    }
-                }).collect::<Vec<u32>>()
-            }
         }
 
-        Ok(root_trace.ok_or_eyre("no root trace")?)
+        Ok(Some(root_trace.ok_or_eyre("no root trace")?))
     }
 
     pub fn build_all_traces_selector(
         &mut self,
         selector: &str,
         entry_point: u128,        
-    ) -> Result<VMTrace> {
+        branch_limit: Option<u32>,
+        segment_limit: Option<u32>,
+        simple_cfg: bool,
+    ) -> Result<Option<VMTrace>> {
         self.calldata = decode_hex(selector)?;
 
         // step through the bytecode until we reach the entry point
@@ -531,7 +564,7 @@ impl VM {
             }
         }
         
-        self.build_all_traces()
+        self.build_all_traces(branch_limit, segment_limit, simple_cfg)
     }
 }
 
