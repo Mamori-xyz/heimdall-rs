@@ -36,6 +36,12 @@ pub struct VMTrace {
     pub children: Vec<VMTrace>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct VMTraceHash {
+    pub hash: U256,
+    pub children: Vec<VMTraceHash>
+}
+
 impl VM {
     /// Run symbolic execution on a given function selector within a contract
     pub fn symbolic_exec_selector(
@@ -432,7 +438,7 @@ impl VM {
         branch_limit: Option<u32>,
         segment_limit: Option<u32>,
         loop_limit: Option<u32>,
-        simple_cfg: bool) -> Result<Option<VMTrace>> {         
+        simple_cfg: bool) -> Result<Option<(VMTrace, VMTraceHash)>> {         
         let mut branch_count: u32 = 0;
         let mut segment_count: u32 = 0;
 
@@ -446,19 +452,25 @@ impl VM {
         let (root_trace, mut next_traces) = self.build_trace()?;
         let root_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
             root_trace.operations.first().ok_or_eyre("no operations")?.last_instruction.instruction, 
-            &root_trace.operations.first().ok_or_eyre("no operations")?.stack);
+            &root_trace.operations.first().ok_or_eyre("no operations")?.stack);        
 
         // init the root trace    
         let mut previous_trace_hash = HashMap::new();
-        previous_trace_hash.insert(root_trace_hash, 1);  
+        previous_trace_hash.insert(root_trace_hash.clone(), 1);  
 
         // update the branch and segment counts for the root trace
         branch_count += 1;
         segment_count += 1;
 
         let mut parent_to_children: HashMap<u32, HashSet<u32>> = HashMap::new();
-        let mut node_id_to_parent_map: HashMap<u32, (Option<u32>, VMTrace)> = HashMap::new();             
-        node_id_to_parent_map.insert(node_counter, (None, root_trace));
+        let mut node_entries_by_id: HashMap<u32, (Option<u32>, VMTraceHash, VMTrace)> = HashMap::new(); // (parent_id, trace_hash, trace)
+        node_entries_by_id.insert(node_counter, (None,
+            VMTraceHash {
+                hash: root_trace_hash,
+                children: Vec::new(),
+            },
+            root_trace,
+        ));
         parent_to_children.entry(node_counter).or_insert(HashSet::new());
 
         // initialize the queue with the first set of traces
@@ -510,7 +522,15 @@ impl VM {
             }
             segment_count += 1;
             node_counter += 1;        
-            node_id_to_parent_map.insert(node_counter, (Some(parent_id), trace));                  
+            node_entries_by_id.insert(node_counter,
+                (Some(parent_id),
+                    VMTraceHash {
+                        hash: current_trace_hash,
+                        children: Vec::new(),
+                    },
+                    trace,
+                ),
+            );
             parent_to_children.entry(parent_id).or_insert(HashSet::new()).insert(node_counter);
             parent_to_children.entry(node_counter).or_insert(HashSet::new());
             while !next_traces.is_empty() {                
@@ -528,13 +548,14 @@ impl VM {
         }).collect::<Vec<u32>>();
 
         let mut root_trace: Option<VMTrace> = None;
+        let mut root_vm_trace_hash: Option<VMTraceHash> = None;
         while !ids.is_empty() {            
             let id = ids.pop().ok_or_eyre("no ids")?;            
             // remove parent from the parent_to_children map
             parent_to_children.remove(&id).ok_or_eyre("no such id")?;            
 
-            // because we are building with nodes that have no children, we can safely remove the current trace from the node_id_to_parent_map            
-            let (parent_id, trace) = node_id_to_parent_map.remove(&id).ok_or_eyre("no such id")?;            
+            // because we are building with nodes that have no children, we can safely remove the current trace from the node_entries_by_id            
+            let (parent_id, vm_trace_hash, trace) = node_entries_by_id.remove(&id).ok_or_eyre("no such id")?;            
             if let Some(parent_id) = parent_id {
                 // remove child from parent
                 parent_to_children.get_mut(&parent_id).ok_or_eyre("no parent id")?.remove(&id);
@@ -543,14 +564,16 @@ impl VM {
                     ids.push(parent_id);
                 }
                 // becase we start nodes with no children, so we don't expect the parent to be not found.                
-                node_id_to_parent_map.get_mut(&parent_id).ok_or_eyre("no parent id")?.1.children.push(trace);                
+                node_entries_by_id.get_mut(&parent_id).ok_or_eyre("no parent id")?.1.children.push(vm_trace_hash);
+                node_entries_by_id.get_mut(&parent_id).ok_or_eyre("no parent id")?.2.children.push(trace);
             } else {
                 // if this is the root trace, set it
                 root_trace = Some(trace);
+                root_vm_trace_hash = Some(vm_trace_hash);
             }
         }        
 
-        Ok(Some(root_trace.ok_or_eyre("no root trace")?))
+        Ok(Some((root_trace.ok_or_eyre("no root trace")?, root_vm_trace_hash.ok_or_eyre("no root vm trace hash")?)))
     }
 
     pub fn build_all_traces_selector(
@@ -561,7 +584,7 @@ impl VM {
         segment_limit: Option<u32>,
         loop_limit: Option<u32>,
         simple_cfg: bool,
-    ) -> Result<Option<VMTrace>> {
+    ) -> Result<Option<(VMTrace, VMTraceHash)>> {
         self.calldata = decode_hex(selector)?;
 
         // step through the bytecode until we reach the entry point
