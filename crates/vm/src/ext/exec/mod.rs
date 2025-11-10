@@ -450,10 +450,11 @@ impl VM {
             .collect::<HashSet<U256>>();
 
         let mut node_counter: u32 = 0;
-        let (root_trace, mut next_traces) = self.build_trace()?;
+        // this hash means the stack before the instruction is executed
         let root_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
-            root_trace.operations.first().ok_or_eyre("no operations")?.last_instruction.instruction, 
-            &root_trace.operations.first().ok_or_eyre("no operations")?.stack);   
+            self.instruction, 
+            &self.stack);
+        let (root_trace, mut next_traces) = self.build_trace()?;  
         let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
             let mut hashes = HashSet::new();
             match trace.operations.last().ok_or_eyre("no operations")?.last_instruction.opcode {
@@ -472,7 +473,7 @@ impl VM {
                 }
                 _ => {
                     hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
-                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction, 
+                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction + 1, 
                         &trace.operations.last().ok_or_eyre("no operations")?.stack));
                 }
             }
@@ -521,16 +522,16 @@ impl VM {
             }            
             
             let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
-            let (trace, mut next_traces) = vm.build_trace()?;
-            // validate with loop detection heuristics. if the trace is a loop, skip it
-            let current_first_pc = trace.operations.first().ok_or_eyre("no operations")?.last_instruction.instruction;
+            // this hash means the stack before the instruction is executed
             let current_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
-                current_first_pc, 
-                &trace.operations.first().ok_or_eyre("no operations")?.stack);
-
+                vm.instruction, 
+                &vm.stack);
+            let (trace, mut next_traces) = vm.build_trace()?;
+            
             // loop detection
             *previous_trace_hash.entry(current_trace_hash).or_insert(0) += 1;
             let loop_limit = loop_limit.unwrap_or(1);
+            // validate with loop detection heuristics. if the trace is a loop, skip it                    
             if *previous_trace_hash.get(&current_trace_hash).ok_or_eyre("no current trace hash")? > loop_limit {
                 continue;
             }
