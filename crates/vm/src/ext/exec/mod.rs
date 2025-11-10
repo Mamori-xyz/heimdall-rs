@@ -471,9 +471,9 @@ impl VM {
                         trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
                         &trace.operations.last().ok_or_eyre("no operations")?.stack));
                 }
-                _ => {
+                _ => {       
                     hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
-                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction + 1, 
+                        trace.instruction, 
                         &trace.operations.last().ok_or_eyre("no operations")?.stack));
                 }
             }
