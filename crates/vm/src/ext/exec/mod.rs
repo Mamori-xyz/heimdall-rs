@@ -2,6 +2,7 @@ mod jump_frame;
 mod util;
 
 use std::{cell::RefCell, sync::Arc};
+use ethers::abi::AbiEncode;
 use ethers::prelude::U256;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -457,23 +458,37 @@ impl VM {
         let (root_trace, mut next_traces) = self.build_trace()?;  
         let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
             let mut hashes = HashSet::new();
-            match trace.operations.last().ok_or_eyre("no operations")?.last_instruction.opcode {
-                0x57 => {
+            let opcode = trace.operations.last().ok_or_eyre("no operations")?.last_instruction.opcode as u128;
+            let last_instruction = trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction;
+            match opcode {
+                0x57_u128 => {
                     hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
                         trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
                         &trace.operations.last().ok_or_eyre("no operations")?.stack));
                     hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
-                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction + 1, 
+                        last_instruction + 1, 
                         &trace.operations.last().ok_or_eyre("no operations")?.stack));
-                }
-                0x56 => {
+                } 
+                0x56_u128 => {
                     hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
                         trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
                         &trace.operations.last().ok_or_eyre("no operations")?.stack));
                 }
-                _ => {       
+                0x5f_u128 | 0x60_u128 | 0x61_u128 | 0x62_u128 | 0x63_u128 | 0x64_u128 | 0x65_u128 |
+                0x66_u128 | 0x67_u128 | 0x68_u128 | 0x69_u128 | 0x6a_u128 | 0x6b_u128 | 0x6c_u128 |
+                0x6d_u128 | 0x6e_u128 | 0x6f_u128 | 0x70_u128 | 0x71_u128 | 0x72_u128 | 0x73_u128 |
+                0x74_u128 | 0x75_u128 | 0x76_u128 | 0x77_u128 | 0x78_u128 | 0x79_u128 | 0x7a_u128 |
+                0x7b_u128 | 0x7c_u128 | 0x7d_u128 | 0x7e_u128 | 0x7f_u128 => {
+                    let next_instruction = last_instruction + (opcode as u128 - 0x5f) + 1;
+                    let hash = Self::jump_stack_hash_helper(&jumpdest_pc,
+                        next_instruction, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack);
+                    println!("instruction {} hash: {:?}", trace.instruction, hash.encode_hex());
+                    hashes.insert(hash);
+                }
+                _ => {
                     hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
-                        trace.instruction, 
+                        last_instruction + 1, 
                         &trace.operations.last().ok_or_eyre("no operations")?.stack));
                 }
             }
