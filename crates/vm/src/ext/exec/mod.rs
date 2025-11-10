@@ -482,8 +482,7 @@ impl VM {
                     let next_instruction = last_instruction + (opcode as u128 - 0x5f) + 1;
                     let hash = Self::jump_stack_hash_helper(&jumpdest_pc,
                         next_instruction, 
-                        &trace.operations.last().ok_or_eyre("no operations")?.stack);
-                    println!("instruction {} hash: {:?}", trace.instruction, hash.encode_hex());
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack);                    
                     hashes.insert(hash);
                 }
                 _ => {
