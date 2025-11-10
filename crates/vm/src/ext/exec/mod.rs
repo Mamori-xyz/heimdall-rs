@@ -39,7 +39,8 @@ pub struct VMTrace {
 #[derive(Clone, Debug, Default)]
 pub struct VMTraceHash {
     pub hash: U256,
-    pub children: Vec<VMTraceHash>
+    pub children: Vec<VMTraceHash>,
+    pub next_possible_segment_hashes: HashSet<U256>,
 }
 
 impl VM {
@@ -452,7 +453,32 @@ impl VM {
         let (root_trace, mut next_traces) = self.build_trace()?;
         let root_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
             root_trace.operations.first().ok_or_eyre("no operations")?.last_instruction.instruction, 
-            &root_trace.operations.first().ok_or_eyre("no operations")?.stack);        
+            &root_trace.operations.first().ok_or_eyre("no operations")?.stack);   
+        let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
+            let mut hashes = HashSet::new();
+            match trace.operations.last().ok_or_eyre("no operations")?.last_instruction.opcode {
+                0x57 => {
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction + 1, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                }
+                0x56 => {
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                }
+                _ => {
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                }
+            }
+            Ok(hashes)
+        };
+        let root_next_possible_segment_hashes = next_possible_segment_hashes_fn(&root_trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?;
 
         // init the root trace    
         let mut previous_trace_hash = HashMap::new();
@@ -468,6 +494,7 @@ impl VM {
             VMTraceHash {
                 hash: root_trace_hash,
                 children: Vec::new(),
+                next_possible_segment_hashes: root_next_possible_segment_hashes,
             },
             root_trace,
         ));
@@ -527,6 +554,7 @@ impl VM {
                     VMTraceHash {
                         hash: current_trace_hash,
                         children: Vec::new(),
+                        next_possible_segment_hashes: next_possible_segment_hashes_fn(&trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?,
                     },
                     trace,
                 ),
