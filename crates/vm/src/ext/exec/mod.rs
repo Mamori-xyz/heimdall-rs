@@ -420,10 +420,8 @@ impl VM {
             .bytecode
             .get((self.instruction - 1) as usize)
             .ok_or_eyre(format!("invalid jumpdest: {}", self.instruction - 1))?
-            .to_owned() == 0x5b {            
-                let mut new_trace = self.clone();
-                new_trace.instruction = last_instruction.instruction + 1;
-                next_traces.push(new_trace);
+            .to_owned() == 0x5b {                                            
+                next_traces.push(self.clone());
                 break;
             }            
         }
