@@ -38,9 +38,10 @@ pub struct VMTrace {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct VMTraceHash {
+pub struct VMTraceExtended {
+    pub id: u32,
     pub hash: U256,
-    pub children: Vec<VMTraceHash>,
+    pub children: Vec<VMTraceExtended>,
     pub next_possible_segment_hashes: HashSet<U256>,
 }
 
@@ -440,7 +441,7 @@ impl VM {
         branch_limit: Option<u32>,
         segment_limit: Option<u32>,
         loop_limit: Option<u32>,
-        simple_cfg: bool) -> Result<Option<(VMTrace, VMTraceHash)>> {         
+        simple_cfg: bool) -> Result<Option<(VMTrace, VMTraceExtended)>> {         
         let mut branch_count: u32 = 0;
         let mut segment_count: u32 = 0;
 
@@ -504,9 +505,10 @@ impl VM {
         segment_count += 1;
 
         let mut parent_to_children: HashMap<u32, HashSet<u32>> = HashMap::new();
-        let mut node_entries_by_id: HashMap<u32, (Option<u32>, VMTraceHash, VMTrace)> = HashMap::new(); // (parent_id, trace_hash, trace)
+        let mut node_entries_by_id: HashMap<u32, (Option<u32>, VMTraceExtended, VMTrace)> = HashMap::new(); // (parent_id, trace_hash, trace)
         node_entries_by_id.insert(node_counter, (None,
-            VMTraceHash {
+            VMTraceExtended {
+                id: node_counter,
                 hash: root_trace_hash,
                 children: Vec::new(),
                 next_possible_segment_hashes: root_next_possible_segment_hashes,
@@ -566,7 +568,8 @@ impl VM {
             node_counter += 1;        
             node_entries_by_id.insert(node_counter,
                 (Some(parent_id),
-                    VMTraceHash {
+                    VMTraceExtended {
+                        id: node_counter,
                         hash: current_trace_hash,
                         children: Vec::new(),
                         next_possible_segment_hashes: next_possible_segment_hashes_fn(&trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?,
@@ -589,9 +592,12 @@ impl VM {
                 None
             }
         }).collect::<Vec<u32>>();
+        
+        // sort the ids to ensure we process the nodes in a consistent order
+        ids.sort();
 
         let mut root_trace: Option<VMTrace> = None;
-        let mut root_vm_trace_hash: Option<VMTraceHash> = None;
+        let mut root_vm_trace_hash: Option<VMTraceExtended> = None;
         while !ids.is_empty() {            
             let id = ids.pop().ok_or_eyre("no ids")?;            
             // remove parent from the parent_to_children map
@@ -627,7 +633,7 @@ impl VM {
         segment_limit: Option<u32>,
         loop_limit: Option<u32>,
         simple_cfg: bool,
-    ) -> Result<Option<(VMTrace, VMTraceHash)>> {
+    ) -> Result<Option<(VMTrace, VMTraceExtended)>> {
         self.calldata = decode_hex(selector)?;
 
         // step through the bytecode until we reach the entry point
