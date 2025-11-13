@@ -1,10 +1,17 @@
 mod jump_frame;
 mod util;
 
+use std::{cell::RefCell, sync::Arc};
+use ethers::abi::AbiEncode;
+use ethers::prelude::U256;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+
 use crate::{
     core::{
         stack::Stack,
         vm::{State, VM},
+        opcodes::Opcode
     },
     ext::exec::{
         jump_frame::JumpFrame,
@@ -28,6 +35,14 @@ pub struct VMTrace {
     pub gas_used: u128,
     pub operations: Vec<State>,
     pub children: Vec<VMTrace>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VMTraceExtended {
+    pub id: u32,
+    pub hash: U256,
+    pub children: Vec<VMTraceExtended>,
+    pub next_possible_segment_hashes: HashSet<U256>,
 }
 
 impl VM {
@@ -320,6 +335,319 @@ impl VM {
         }
 
         Ok(Some(vm_trace))
+    }
+
+    fn jump_stack_hash_helper(
+        jump_dest_pc: &HashSet<U256>,
+        pc: u128,
+        stack: &Stack,
+    ) -> U256 {
+        let mut hash_data: Vec<U256> = Vec::new();
+        hash_data.push(U256::from(pc));        
+        for (i, s) in stack.stack.iter().enumerate() {        
+            let solidified_operation = s.operation.solidify();
+            if jump_dest_pc.contains(&s.value) && solidified_operation.starts_with("0x") && !solidified_operation.contains(" ") {
+                hash_data.push(U256::from(i));
+                hash_data.push(s.value);                            
+            }            
+        }
+    
+        let mut data: Vec<u8> = Vec::new();
+        for v in &hash_data {
+            data.append(&mut v.to_string().into_bytes());
+        }
+        let jump_and_jumpi_hash = U256::from(ethers::core::utils::keccak256(&data));
+        jump_and_jumpi_hash
+    }
+
+    fn program_counter(contract_bytecode: Vec<u8>) -> HashMap<U256, Opcode> {
+        let mut program_counter = 0;
+        let mut pc_n_opcode: HashMap<U256, Opcode> = HashMap::new();
+        while program_counter < contract_bytecode.len() {
+            let operation = Opcode::new(contract_bytecode[program_counter]);            
+            let current_pc = program_counter;
+    
+            // handle PUSH0 -> PUSH32, which require us to push the next N bytes
+            // onto the stack
+            if operation.code >= 0x5f && operation.code <= 0x7f {
+                let byte_count_to_push: u8 = operation.code - 0x5f;
+                program_counter += byte_count_to_push as usize;
+            }
+            pc_n_opcode.insert(U256::from(current_pc), operation);
+    
+            program_counter += 1;
+        }
+    
+        pc_n_opcode
+    }
+
+    // build a trace from current instruction and return the next traces to explore
+    fn build_trace(&mut self) -> Result<(VMTrace, Vec<VM>)> {
+        let mut root_trace = VMTrace {
+            instruction: self.instruction,
+            gas_used: 0,
+            operations: Vec::new(),
+            children: Vec::new(),
+        };
+
+        let mut next_traces = Vec::new();
+        while self.bytecode.len() >= self.instruction as usize {               
+            let state = self.step()?;            
+            let last_instruction = state.last_instruction.clone();
+            root_trace.operations.push(state);
+            root_trace.gas_used = self.gas_used;    
+
+            if self.exitcode != 255 || !self.returndata.is_empty() {                
+                break;
+            }
+
+            // jump / jumpi
+            if last_instruction.opcode == 0x57 || last_instruction.opcode == 0x56 {
+                if last_instruction.opcode == 0x57 {
+                    // continue branch
+                    let mut new_trace = self.clone();
+                    new_trace.instruction = last_instruction.instruction + 1;
+                    next_traces.push(new_trace);
+                }
+
+                // jump branch
+                let mut new_trace = self.clone();
+                new_trace.instruction = last_instruction.inputs[0].as_u128() + 1;
+                next_traces.push(new_trace);
+                break;
+            }
+
+            // next instruction is jumpdest
+            if self
+            .bytecode
+            .get((self.instruction - 1) as usize)
+            .ok_or_eyre(format!("invalid jumpdest: {}", self.instruction - 1))?
+            .to_owned() == 0x5b {                                            
+                next_traces.push(self.clone());
+                break;
+            }            
+        }
+
+        Ok((root_trace, next_traces))
+    }
+
+    // build all traces from the current instruction according to the branch, segment, and loop limits
+    // - The branch limit is the maximum number of branches to explore. If not provided, it will be ignored.
+    // - The segment limit is the maximum number of segments to explore. If not provided, it will be ignored.
+    // - The loop limit is the maximum number of times a segment can appear in the branch. If not provided, it will be set to 1.
+    // - If simple_cfg is true, we will only process each similar trace once by checking globally and ignore the branch and segment limits.
+    // - When return None, it means we have reached the branch or segment limits.
+    pub fn build_all_traces(&mut self,
+        branch_limit: Option<u32>,
+        segment_limit: Option<u32>,
+        loop_limit: Option<u32>,
+        simple_cfg: bool) -> Result<Option<(VMTrace, VMTraceExtended)>> {         
+        let mut branch_count: u32 = 0;
+        let mut segment_count: u32 = 0;
+
+        let jumpdest_pc = Self::program_counter(self.bytecode.clone())
+            .iter()
+            .filter(|(k, v)| v.code == 0x5b)
+            .map(|(k, _)| k.clone())
+            .collect::<HashSet<U256>>();
+
+        let mut node_counter: u32 = 0;
+        // this hash means the stack before the instruction is executed
+        let root_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
+            self.instruction, 
+            &self.stack);
+        let (root_trace, mut next_traces) = self.build_trace()?;  
+        let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
+            let mut hashes = HashSet::new();
+            let opcode = trace.operations.last().ok_or_eyre("no operations")?.last_instruction.opcode as u128;
+            let last_instruction = trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction;
+            match opcode {
+                0x57_u128 => {
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        last_instruction + 1, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                } 
+                0x56_u128 => {
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                }
+                0x5f_u128 | 0x60_u128 | 0x61_u128 | 0x62_u128 | 0x63_u128 | 0x64_u128 | 0x65_u128 |
+                0x66_u128 | 0x67_u128 | 0x68_u128 | 0x69_u128 | 0x6a_u128 | 0x6b_u128 | 0x6c_u128 |
+                0x6d_u128 | 0x6e_u128 | 0x6f_u128 | 0x70_u128 | 0x71_u128 | 0x72_u128 | 0x73_u128 |
+                0x74_u128 | 0x75_u128 | 0x76_u128 | 0x77_u128 | 0x78_u128 | 0x79_u128 | 0x7a_u128 |
+                0x7b_u128 | 0x7c_u128 | 0x7d_u128 | 0x7e_u128 | 0x7f_u128 => {
+                    let next_instruction = last_instruction + (opcode as u128 - 0x5f) + 1;
+                    let hash = Self::jump_stack_hash_helper(&jumpdest_pc,
+                        next_instruction, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack);                    
+                    hashes.insert(hash);
+                }
+                _ => {
+                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
+                        last_instruction + 1, 
+                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
+                }
+            }
+            Ok(hashes)
+        };
+        let root_next_possible_segment_hashes = next_possible_segment_hashes_fn(&root_trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?;
+
+        // init the root trace    
+        let mut previous_trace_hash = HashMap::new();
+        previous_trace_hash.insert(root_trace_hash.clone(), 1);  
+
+        // update the branch and segment counts for the root trace
+        branch_count += 1;
+        segment_count += 1;
+
+        let mut parent_to_children: HashMap<u32, HashSet<u32>> = HashMap::new();
+        let mut node_entries_by_id: HashMap<u32, (Option<u32>, VMTraceExtended, VMTrace)> = HashMap::new(); // (parent_id, trace_hash, trace)
+        node_entries_by_id.insert(node_counter, (None,
+            VMTraceExtended {
+                id: node_counter,
+                hash: root_trace_hash,
+                children: Vec::new(),
+                next_possible_segment_hashes: root_next_possible_segment_hashes,
+            },
+            root_trace,
+        ));
+        parent_to_children.entry(node_counter).or_insert(HashSet::new());
+
+        // initialize the queue with the first set of traces
+        let mut queue: VecDeque<(u32, HashMap<U256, u32>, VM)> = VecDeque::new();
+        while !next_traces.is_empty() {        
+            queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
+        }
+
+        // only used for simple cfg
+        let mut processed_nodes = HashSet::new();  
+        // process the queue until it is empty
+        while !queue.is_empty() {   
+            // only check branch and segment limits if we are not building a simple cfg
+            if !simple_cfg {
+                if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
+                    return Ok(None);
+                }
+                if segment_limit.is_some() && segment_count >= segment_limit.unwrap() {
+                    return Ok(None);
+                }
+            }            
+            
+            let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
+            // this hash means the stack before the instruction is executed
+            let current_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
+                vm.instruction, 
+                &vm.stack);
+            let (trace, mut next_traces) = vm.build_trace()?;
+            
+            // loop detection
+            *previous_trace_hash.entry(current_trace_hash).or_insert(0) += 1;
+            let loop_limit = loop_limit.unwrap_or(1);
+            // validate with loop detection heuristics. if the trace is a loop, skip it                    
+            if *previous_trace_hash.get(&current_trace_hash).ok_or_eyre("no current trace hash")? > loop_limit {
+                continue;
+            }
+
+            // if we are building a simple cfg, we only want to process each similar trace once by checking globally
+            if simple_cfg {     
+                if !processed_nodes.contains(&current_trace_hash) {
+                    processed_nodes.insert(current_trace_hash);
+                } else {
+                    continue;
+                }
+            }   
+
+            if next_traces.len() > 1 {
+                branch_count += 1;
+            }
+            segment_count += 1;
+            node_counter += 1;        
+            node_entries_by_id.insert(node_counter,
+                (Some(parent_id),
+                    VMTraceExtended {
+                        id: node_counter,
+                        hash: current_trace_hash,
+                        children: Vec::new(),
+                        next_possible_segment_hashes: next_possible_segment_hashes_fn(&trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?,
+                    },
+                    trace,
+                ),
+            );
+            parent_to_children.entry(parent_id).or_insert(HashSet::new()).insert(node_counter);
+            parent_to_children.entry(node_counter).or_insert(HashSet::new());
+            while !next_traces.is_empty() {                
+                queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
+            }
+        }        
+
+        // always start with the nodes that have no children
+        let mut ids = parent_to_children.iter().filter_map(|(parent_id, children)| {
+            if children.is_empty() {
+                Some(*parent_id)
+            } else {
+                None
+            }
+        }).collect::<Vec<u32>>();
+        
+        // sort the ids to ensure we process the nodes in a consistent order
+        ids.sort();
+
+        let mut root_trace: Option<VMTrace> = None;
+        let mut root_vm_trace_hash: Option<VMTraceExtended> = None;
+        while !ids.is_empty() {            
+            let id = ids.pop().ok_or_eyre("no ids")?;            
+            // remove parent from the parent_to_children map
+            parent_to_children.remove(&id).ok_or_eyre("no such id")?;            
+
+            // because we are building with nodes that have no children, we can safely remove the current trace from the node_entries_by_id            
+            let (parent_id, vm_trace_hash, trace) = node_entries_by_id.remove(&id).ok_or_eyre("no such id")?;            
+            if let Some(parent_id) = parent_id {
+                // remove child from parent
+                parent_to_children.get_mut(&parent_id).ok_or_eyre("no parent id")?.remove(&id);
+                // if the parent has no children, add it to the ids list
+                if parent_to_children.get(&parent_id).ok_or_eyre("no parent id")?.len() == 0 {
+                    ids.push(parent_id);
+                }
+                // becase we start nodes with no children, so we don't expect the parent to be not found.                
+                node_entries_by_id.get_mut(&parent_id).ok_or_eyre("no parent id")?.1.children.push(vm_trace_hash);
+                node_entries_by_id.get_mut(&parent_id).ok_or_eyre("no parent id")?.2.children.push(trace);
+            } else {
+                // if this is the root trace, set it
+                root_trace = Some(trace);
+                root_vm_trace_hash = Some(vm_trace_hash);
+            }
+        }        
+
+        Ok(Some((root_trace.ok_or_eyre("no root trace")?, root_vm_trace_hash.ok_or_eyre("no root vm trace hash")?)))
+    }
+
+    pub fn build_all_traces_selector(
+        &mut self,
+        selector: &str,
+        entry_point: u128,        
+        branch_limit: Option<u32>,
+        segment_limit: Option<u32>,
+        loop_limit: Option<u32>,
+        simple_cfg: bool,
+    ) -> Result<Option<(VMTrace, VMTraceExtended)>> {
+        self.calldata = decode_hex(selector)?;
+
+        // step through the bytecode until we reach the entry point
+        while self.bytecode.len() >= self.instruction as usize && (self.instruction <= entry_point)
+        {
+            self.step()?;
+
+            // this shouldn't be necessary, but it's safer to have it
+            if self.exitcode != 255 || !self.returndata.is_empty() {
+                break;
+            }
+        }
+        
+        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg)
     }
 }
 
