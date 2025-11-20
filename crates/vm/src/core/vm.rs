@@ -768,7 +768,7 @@ impl VM {
                 let result = keccak256(data);
 
                 // consume dynamic gas
-                let minimum_word_size = ((size + 31) / 32) as u128;
+                let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
                 let gas_cost = 6 * minimum_word_size + self.memory.expansion_cost(offset, size);
                 self.consume_gas(gas_cost);
 
@@ -828,7 +828,7 @@ impl VM {
                 // Safely convert U256 to usize
                 let i: usize = i.try_into().unwrap_or(usize::MAX);
 
-                let result = if i + 32 > self.calldata.len() {
+                let result = if i.saturating_add(32) > self.calldata.len() {
                     let mut value = [0u8; 32];
 
                     if i <= self.calldata.len() {

@@ -27,7 +27,9 @@ use crate::{
 use eyre::{OptionExt, Result};
 use heimdall_common::utils::strings::decode_hex;
 use std::{collections::HashMap, time::Instant};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use tracing::{trace, warn};
+use log::error;
 
 #[derive(Clone, Debug, Default)]
 pub struct VMTrace {
@@ -392,7 +394,23 @@ impl VM {
 
         let mut next_traces = Vec::new();
         while self.bytecode.len() >= self.instruction as usize {               
-            let state = self.step()?;            
+            // NOTE: here
+            let state = match catch_unwind(AssertUnwindSafe(|| self.step())) {
+                Ok(Ok(state)) => state,
+                Ok(Err(e)) => return Err(e),
+                Err(panic) => {
+                    let panic_message = if let Some(s) = panic.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic message".to_string()
+                    };
+                    error!("panic occurred, this branch is incorrect, break the loop: {:?}, self.instruction: {:#x}", panic_message, self.instruction);
+                    break; // panic occurred, this branch is incorrect, break the loop
+                }
+            };      
+
             let last_instruction = state.last_instruction.clone();
             root_trace.operations.push(state);
             root_trace.gas_used = self.gas_used;    
