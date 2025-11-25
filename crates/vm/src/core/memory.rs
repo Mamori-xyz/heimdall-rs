@@ -179,11 +179,11 @@ impl Memory {
         // Calculate the new size of the memory
         let new_memory_word_size = ((offset.saturating_add(size).saturating_add(31)) / 32) as u128;
         let new_memory_cost =
-            ((new_memory_word_size.pow(2)) / 512).saturating_add(3 * new_memory_word_size);
+            ((new_memory_word_size.saturating_pow(2)) / 512).saturating_add(3_u128.saturating_mul(new_memory_word_size));
         if new_memory_cost < self.memory_cost() {
             0
         } else {
-            new_memory_cost - self.memory_cost()
+            new_memory_cost.saturating_sub(self.memory_cost())
         }
     }
 

@@ -211,7 +211,7 @@ impl VM {
     pub fn consume_gas(&mut self, amount: u128) -> bool {
         // REVERT if out of gas
         if amount > self.gas_remaining {
-            self.gas_used += self.gas_remaining;
+            self.gas_used = self.gas_used.saturating_add(self.gas_remaining);
             self.gas_remaining = 0;
             self.exit(9, Vec::new());
             return false;
@@ -768,8 +768,8 @@ impl VM {
                 let result = keccak256(data);
 
                 // consume dynamic gas
-                let minimum_word_size = ((size + 31) / 32) as u128;
-                let gas_cost = 6 * minimum_word_size + self.memory.expansion_cost(offset, size);
+                let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
+                let gas_cost = 6_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
                 self.stack.push(U256::from(result), operation);
@@ -828,7 +828,7 @@ impl VM {
                 // Safely convert U256 to usize
                 let i: usize = i.try_into().unwrap_or(usize::MAX);
 
-                let result = if i + 32 > self.calldata.len() {
+                let result = if i.saturating_add(32) > self.calldata.len() {
                     let mut value = [0u8; 32];
 
                     if i <= self.calldata.len() {
@@ -863,7 +863,7 @@ impl VM {
                 let size: usize = size.try_into().unwrap_or(8 * 32);
 
                 // clamp values to calldata length
-                let end_offset_clamped = (offset + size).min(self.calldata.len());
+                let end_offset_clamped = (offset.saturating_add(size)).min(self.calldata.len());
                 let size = size.min(self.calldata.len());
 
                 let mut value =
@@ -875,8 +875,8 @@ impl VM {
                 }
 
                 // consume dynamic gas
-                let minimum_word_size = ((size + 31) / 32) as u128;
-                let gas_cost = 3 * minimum_word_size + self.memory.expansion_cost(offset, size);
+                let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
+                let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
                 self.memory.store_with_opcode(
@@ -907,7 +907,7 @@ impl VM {
                 let offset: usize = offset.try_into().unwrap_or(8 * 32);
                 let size: usize = size.try_into().unwrap_or(8 * 32);
 
-                let value_offset_safe = (offset + size).min(self.bytecode.len());
+                let value_offset_safe = (offset.saturating_add(size)).min(self.bytecode.len());
                 let mut value =
                     self.bytecode.get(offset..value_offset_safe).unwrap_or(&[]).to_owned();
 
@@ -917,8 +917,8 @@ impl VM {
                 }
 
                 // consume dynamic gas
-                let minimum_word_size = ((size + 31) / 32) as u128;
-                let gas_cost = 3 * minimum_word_size + self.memory.expansion_cost(offset, size);
+                let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
+                let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
                 self.memory.store_with_opcode(
@@ -966,9 +966,9 @@ impl VM {
                 value.fill(0xff);
 
                 // consume dynamic gas
-                let minimum_word_size = ((size + 31) / 32) as u128;
+                let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
                 let gas_cost =
-                    3 * minimum_word_size + self.memory.expansion_cost(dest_offset, size);
+                    3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(dest_offset, size));
                 self.consume_gas(gas_cost);
                 if !self.address_access_set.contains(&address) {
                     self.consume_gas(2600);
@@ -1006,9 +1006,9 @@ impl VM {
                 value.fill(0xff);
 
                 // consume dynamic gas
-                let minimum_word_size = ((size + 31) / 32) as u128;
+                let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
                 let gas_cost =
-                    3 * minimum_word_size + self.memory.expansion_cost(dest_offset, size);
+                    3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(dest_offset, size));
                 self.consume_gas(gas_cost);
 
                 self.memory.store_with_opcode(
@@ -1237,7 +1237,7 @@ impl VM {
                 let dest_offset: usize = dest_offset.try_into().unwrap_or(usize::MAX);
                 let offset: usize = offset.try_into().unwrap_or(usize::MAX);
                 let size: usize = size.try_into().unwrap_or(usize::MAX);
-                let value_offset_safe = (offset + size)
+                let value_offset_safe = (offset.saturating_add(size))
                     .min(self.memory.size().try_into().expect("failed to convert u128 to usize"));
 
                 let mut value =
@@ -1249,8 +1249,8 @@ impl VM {
                 }
 
                 // consume dynamic gas
-                let minimum_word_size = ((size + 31) / 32) as u128;
-                let gas_cost = 3 * minimum_word_size + self.memory.expansion_cost(offset, size);
+                let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
+                let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
                 self.memory.store_with_opcode(
@@ -1334,9 +1334,9 @@ impl VM {
                 let data = self.memory.read(offset, size);
 
                 // consume dynamic gas
-                let gas_cost = (375 * (topic_count as u128)) +
-                    8 * (size as u128) +
-                    self.memory.expansion_cost(offset, size);
+                let gas_cost = 375_u128.saturating_mul(topic_count as u128).saturating_add(
+                    8_u128.saturating_mul(size as u128)).saturating_add(
+                    self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
                 // no need for a panic check because the length of events should never be larger
