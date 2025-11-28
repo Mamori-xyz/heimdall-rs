@@ -767,7 +767,7 @@ impl VM {
                         break;
                     } else {
                         current_node = route.pop().ok_or_eyre("no route")?;
-                        if current_node.0 == last_instruction.instruction as usize {
+                        if current_node.0 == self.instruction as usize - 1 {
                             self.instruction = last_instruction.instruction + 1;
                         } else {
                             return Err(eyre::eyre!("route does not match the last instruction [6]"));
