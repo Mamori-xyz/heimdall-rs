@@ -360,6 +360,35 @@ impl VM {
         jump_and_jumpi_hash
     }
 
+    fn generate_safe_node_id_by_route(
+        route: Vec<(usize, usize)>,
+    ) -> u32 {
+        let mut safe_node_id = 0;
+        let mut hash_data: Vec<u128> = Vec::new();        
+        for node in route.clone() {        
+            hash_data.push(node.0 as u128);
+            hash_data.push(node.1 as u128);                            
+        }
+
+        loop {
+            let mut data: Vec<u8> = Vec::new();
+            for v in &hash_data {
+                data.append(&mut v.to_be_bytes().to_vec());
+            }    
+
+            let hash = U256::from(ethers::core::utils::keccak256(&data));
+            let hash_within_u32= hash % U256::from(u32::MAX);
+            safe_node_id = hash_within_u32.as_u32();
+            if u32::MAX - safe_node_id > 1_000_000 {
+                break;
+            } else {
+                hash_data.push(safe_node_id as u128);
+            }
+        }
+        
+        safe_node_id
+    }
+
     fn program_counter(contract_bytecode: Vec<u8>) -> HashMap<U256, Opcode> {
         let mut program_counter = 0;
         let mut pc_n_opcode: HashMap<U256, Opcode> = HashMap::new();
@@ -459,6 +488,7 @@ impl VM {
             self.instruction, 
             &self.stack);
         let (root_trace, mut next_traces) = if let Some(route) = route {
+            node_counter = Self::generate_safe_node_id_by_route(route.clone());
             self.build_trace_start_from_route(route)?
         } else {
             self.build_trace()?
