@@ -360,6 +360,31 @@ impl VM {
         jump_and_jumpi_hash
     }
 
+    // generate a safe node id by route
+    fn generate_safe_node_id_by_route(
+        route: Vec<(usize, usize)>,
+    ) -> u32 {
+        let mut safe_node_id = 0;
+        let mut data: Vec<u8> = Vec::new();        
+        for node in route.clone() {        
+            data.append(&mut node.0.to_be_bytes().to_vec());
+            data.append(&mut node.1.to_be_bytes().to_vec());                            
+        }        
+
+        loop {              
+            let hash = U256::from(ethers::core::utils::keccak256(&data));
+            let hash_within_u32= hash % U256::from(u32::MAX);
+            safe_node_id = hash_within_u32.as_u32();
+            if u32::MAX - safe_node_id > 1_000_000 {
+                break;
+            } else {
+                data.append(&mut safe_node_id.to_be_bytes().to_vec());
+            }
+        }
+        
+        safe_node_id
+    }
+
     fn program_counter(contract_bytecode: Vec<u8>) -> HashMap<U256, Opcode> {
         let mut program_counter = 0;
         let mut pc_n_opcode: HashMap<U256, Opcode> = HashMap::new();
@@ -422,10 +447,10 @@ impl VM {
             .bytecode
             .get((self.instruction - 1) as usize)
             .ok_or_eyre(format!("invalid jumpdest: {}", self.instruction - 1))?
-            .to_owned() == 0x5b {                                            
+            .to_owned() == 0x5b {
                 next_traces.push(self.clone());
                 break;
-            }            
+            }
         }
 
         Ok((root_trace, next_traces))
@@ -441,7 +466,9 @@ impl VM {
         branch_limit: Option<u32>,
         segment_limit: Option<u32>,
         loop_limit: Option<u32>,
-        simple_cfg: bool) -> Result<Option<(VMTrace, VMTraceExtended)>> {         
+        simple_cfg: bool,
+        route: Option<Vec<(usize, usize)>>,
+    ) -> Result<Option<(VMTrace, VMTraceExtended)>> {         
         let mut branch_count: u32 = 0;
         let mut segment_count: u32 = 0;
 
@@ -456,7 +483,13 @@ impl VM {
         let root_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
             self.instruction, 
             &self.stack);
-        let (root_trace, mut next_traces) = self.build_trace()?;  
+        let (root_trace, mut next_traces) = if let Some(route) = route {
+            node_counter = Self::generate_safe_node_id_by_route(route.clone());
+            self.build_trace_start_from_route(route)?
+        } else {
+            self.build_trace()?
+        };
+        
         let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
             let mut hashes = HashSet::new();
             let opcode = trace.operations.last().ok_or_eyre("no operations")?.last_instruction.opcode as u128;
@@ -633,6 +666,7 @@ impl VM {
         segment_limit: Option<u32>,
         loop_limit: Option<u32>,
         simple_cfg: bool,
+        route: Option<Vec<(usize, usize)>>,
     ) -> Result<Option<(VMTrace, VMTraceExtended)>> {
         self.calldata = decode_hex(selector)?;
 
@@ -647,7 +681,137 @@ impl VM {
             }
         }
         
-        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg)
+        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg, route)
+    }
+
+    // build a trace starting from a given route
+    // each element in the route is a tuple of (start pc in segment, end pc in segment)
+    // if the segment only has one instruction, the end pc should be the same as the start pc.
+    pub fn build_trace_start_from_route(&mut self, mut route: Vec<(usize, usize)>) -> Result<(VMTrace, Vec<VM>)> {
+        let mut root_trace = VMTrace {
+            instruction: self.instruction,
+            gas_used: 0,
+            operations: Vec::new(),
+            children: Vec::new(),
+        };
+
+        route.reverse();
+        let mut current_node = route.pop().ok_or_eyre("no route")?;
+        if current_node.0 != self.instruction as usize - 1 {
+            return Err(eyre::eyre!("route does not start at the current instruction [1]"));
+        }
+
+        let mut next_traces = Vec::new();
+        while self.bytecode.len() >= self.instruction as usize {    
+            let state = self.step()?;
+            let last_instruction = state.last_instruction.clone();
+            
+            if last_instruction.opcode == 0x57 { // jumpi
+                if last_instruction.instruction as usize - 1 == current_node.1 {
+                    if route.is_empty() {
+                        root_trace = VMTrace {
+                            instruction: last_instruction.instruction,
+                            gas_used: self.gas_used,
+                            operations: Vec::from([state]),
+                            children: Vec::new(),
+                        };                        
+                        self.instruction = last_instruction.instruction + 1;
+                        next_traces.push(self.clone());
+                        self.instruction = last_instruction.inputs[0].as_u128() + 1;
+                        next_traces.push(self.clone());
+                        break;
+                    } else {
+                        current_node = route.pop().ok_or_eyre("no route")?;
+                        if current_node.0 == last_instruction.instruction as usize {
+                            self.instruction = last_instruction.instruction + 1;
+                        } else if current_node.0 == last_instruction.inputs[0].as_u128() as usize {
+                            self.instruction = last_instruction.inputs[0].as_u128() + 1;
+                        } else {
+                            return Err(eyre::eyre!("route does not match the last instruction [2]"));
+                        }
+                    }                 
+                } else {
+                    return Err(eyre::eyre!("route does not match the last instruction [3]"));
+                }            
+            } else if last_instruction.opcode == 0x56 { // jump
+                if last_instruction.instruction as usize - 1 == current_node.1 {
+                    if route.is_empty() {
+                        root_trace = VMTrace {
+                            instruction: last_instruction.instruction,
+                            gas_used: self.gas_used,
+                            operations: Vec::from([state]),
+                            children: Vec::new(),
+                        };                        
+                        self.instruction = last_instruction.inputs[0].as_u128() + 1;
+                        next_traces.push(self.clone());                      
+                        break;
+                    } else {
+                        current_node = route.pop().ok_or_eyre("no route")?;
+                        if current_node.0 == last_instruction.inputs[0].as_u128() as usize {
+                            self.instruction = last_instruction.inputs[0].as_u128() + 1;
+                        } else {
+                            return Err(eyre::eyre!("route does not match the last instruction [4]"));
+                        }
+                    }
+                } else {
+                    return Err(eyre::eyre!("route does not match the last instruction [5]"));
+                }
+            } else if last_instruction.opcode == 0x00 ||
+                    last_instruction.opcode == 0xfd ||
+                    last_instruction.opcode == 0xfe ||
+                    last_instruction.opcode == 0xff ||
+                    last_instruction.opcode == 0xf3 { // if meet the stop, revert, invalid, selfdestruct, or return instruction, we should end the trace
+                if last_instruction.instruction as usize - 1 == current_node.1 {
+                    if route.is_empty() {                        
+                        root_trace = VMTrace {
+                            instruction: last_instruction.instruction,
+                            gas_used: self.gas_used,
+                            operations: Vec::from([state]),
+                            children: Vec::new(),
+                        };                        
+                        break;
+                    } else {
+                        return Err(eyre::eyre!("route should end here, but got more instructions in the route"));
+                    }
+                } else {
+                    return Err(eyre::eyre!("route does not match the last instruction [8]"));
+                }
+            } else if self
+            .bytecode
+            .get((self.instruction - 1) as usize)
+            .ok_or_eyre(format!("invalid jumpdest: {}", self.instruction - 1))?
+            .to_owned() == 0x5b {                    
+                if last_instruction.instruction as usize - 1 == current_node.1 {
+                    if route.is_empty() {
+                        root_trace = VMTrace {
+                            instruction: last_instruction.instruction,
+                            gas_used: self.gas_used,
+                            operations: Vec::from([state]),
+                            children: Vec::new(),
+                        };
+                        next_traces.push(self.clone());
+                        break;
+                    } else {
+                        current_node = route.pop().ok_or_eyre("no route")?;
+                        if current_node.0 != self.instruction as usize - 1 {
+                            return Err(eyre::eyre!("route does not match the last instruction [6]"));
+                        }
+                    }
+                } else {
+                    return Err(eyre::eyre!("route does not match the last instruction [7]"));
+                }
+            }
+
+            if self.exitcode != 255 || !self.returndata.is_empty() {                
+                break;
+            }
+        }
+
+        if !route.is_empty() {
+            return Err(eyre::eyre!("not all routes were taken"));
+        }
+
+        Ok((root_trace, next_traces))
     }
 }
 
