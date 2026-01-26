@@ -485,10 +485,17 @@ impl VM {
             &self.stack);
         let (root_trace, mut next_traces) = if let Some(route) = route {
             node_counter = Self::generate_safe_node_id_by_route(route.clone());
+            trace!("build_all_traces: route = {:?}, root trace hash = {:#x}, root node id = {:?}", 
+                route.iter().map(|(start, end)| format!("({:#x}, {:#x})", start, end)).collect::<Vec<String>>().join(", "),
+                root_trace_hash,
+                node_counter,
+            );
             self.build_trace_start_from_route(route)?
         } else {
             self.build_trace()?
         };
+        let root_node_id = node_counter;
+        trace!("build_all_traces: root node id = {:?}", root_node_id);
         
         let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
             let mut hashes = HashSet::new();
@@ -571,6 +578,7 @@ impl VM {
             }            
             
             let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
+
             // this hash means the stack before the instruction is executed
             let current_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
                 vm.instruction, 
@@ -582,6 +590,8 @@ impl VM {
             let loop_limit = loop_limit.unwrap_or(1);
             // validate with loop detection heuristics. if the trace is a loop, skip it                    
             if *previous_trace_hash.get(&current_trace_hash).ok_or_eyre("no current trace hash")? > loop_limit {
+                trace!("build_all_traces: loop detected at {:#x}, current trace hash = {:#x}, parent id = {:?}", 
+                    vm.instruction, current_trace_hash, parent_id);
                 continue;
             }
 
@@ -589,7 +599,13 @@ impl VM {
             if simple_cfg {     
                 if !processed_nodes.contains(&current_trace_hash) {
                     processed_nodes.insert(current_trace_hash);
+                } else if parent_id == root_node_id {
+                    trace!("build_all_traces: find same trace at {:#x} but it's parent is the root node, current trace hash = {:#x}, parent id = {:?}", 
+                        vm.instruction, current_trace_hash, parent_id);
+                    // If the parent is the root node, we should not skip the trace
                 } else {
+                    trace!("build_all_traces: find same trace at {:#x}, current trace hash = {:#x}, parent id = {:?}", 
+                        vm.instruction, current_trace_hash, parent_id);
                     continue;
                 }
             }   
@@ -668,6 +684,7 @@ impl VM {
         simple_cfg: bool,
         route: Option<Vec<(usize, usize)>>,
     ) -> Result<Option<(VMTrace, VMTraceExtended)>> {
+        trace!("build_all_traces_selector: selector = {}, entry_point = {:#x}", selector, entry_point);
         self.calldata = decode_hex(selector)?;
 
         // step through the bytecode until we reach the entry point
