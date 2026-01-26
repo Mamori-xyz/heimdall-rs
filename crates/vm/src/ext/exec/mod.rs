@@ -489,6 +489,7 @@ impl VM {
         } else {
             self.build_trace()?
         };
+        let root_node_id = node_counter;
         
         let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
             let mut hashes = HashSet::new();
@@ -589,6 +590,8 @@ impl VM {
             if simple_cfg {     
                 if !processed_nodes.contains(&current_trace_hash) {
                     processed_nodes.insert(current_trace_hash);
+                } else if parent_id == root_node_id {
+                    // If the parent is the root node, we should not skip the trace
                 } else {
                     continue;
                 }
