@@ -460,7 +460,7 @@ impl VM {
     // - The branch limit is the maximum number of branches to explore. If not provided, it will be ignored.
     // - The segment limit is the maximum number of segments to explore. If not provided, it will be ignored.
     // - The loop limit is the maximum number of times a segment can appear in the branch. If not provided, it will be set to 1.
-    // - If simple_cfg is true, we will only process each similar trace once by checking globally and ignore the branch and segment limits.
+    // - If simple_cfg is true, we will only process each similar trace once by checking globally.
     // - When return None, it means we have reached the branch or segment limits.
     pub fn build_all_traces(&mut self,
         branch_limit: Option<u32>,
@@ -560,16 +560,18 @@ impl VM {
         // only used for simple cfg
         let mut processed_nodes = HashSet::new();  
         // process the queue until it is empty
-        while !queue.is_empty() {   
-            // only check branch and segment limits if we are not building a simple cfg
-            if !simple_cfg {
-                if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
-                    return Ok(None);
+        while !queue.is_empty() {
+            let hit_branch_limit =
+                branch_limit.is_some() && branch_count >= branch_limit.unwrap();
+            let hit_segment_limit =
+                segment_limit.is_some() && segment_count >= segment_limit.unwrap();
+
+            if hit_branch_limit || hit_segment_limit {
+                if simple_cfg {
+                    break;
                 }
-                if segment_limit.is_some() && segment_count >= segment_limit.unwrap() {
-                    return Ok(None);
-                }
-            }            
+                return Ok(None);
+            }
             
             let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
             // this hash means the stack before the instruction is executed
@@ -820,5 +822,48 @@ impl VM {
 
 #[cfg(test)]
 mod tests {
-    // TODO: add tests for symbolic execution & recursive_map
+    use ethers::types::H160;
+
+    use crate::core::vm::VM;
+    use heimdall_common::utils::strings::decode_hex;
+
+    fn new_exec_test_vm(bytecode: &str) -> VM {
+        VM::new(
+            &decode_hex(bytecode).expect("failed to decode bytecode"),
+            &[],
+            "0x6865696d64616c6c000000000061646472657373"
+                .parse::<H160>()
+                .expect("failed to parse H160"),
+            "0x6865696d64616c6c0000000000006f726967696e"
+                .parse::<H160>()
+                .expect("failed to parse H160"),
+            "0x6865696d64616c6c00000000000063616c6c6572"
+                .parse::<H160>()
+                .expect("failed to parse H160"),
+            0,
+            9999999999,
+        )
+    }
+
+    #[test]
+    fn test_build_all_traces_selector_applies_branch_limit_in_simple_cfg() {
+        let mut vm = new_exec_test_vm("0x6001600657005b00");
+
+        let traces =
+            vm.build_all_traces_selector("0x", 0, Some(1), None, Some(1), true, None)
+                .expect("trace building failed");
+
+        assert!(traces.is_none());
+    }
+
+    #[test]
+    fn test_build_all_traces_selector_applies_segment_limit_in_simple_cfg() {
+        let mut vm = new_exec_test_vm("0x6001600657005b00");
+
+        let traces =
+            vm.build_all_traces_selector("0x", 0, None, Some(1), Some(1), true, None)
+                .expect("trace building failed");
+
+        assert!(traces.is_none());
+    }
 }
