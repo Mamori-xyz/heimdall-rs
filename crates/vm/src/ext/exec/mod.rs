@@ -551,10 +551,10 @@ impl VM {
         ));
         parent_to_children.entry(node_counter).or_insert(HashSet::new());
 
-        // initialize the queue with the first set of traces
+        // initialize the queue with the first set of traces in FIFO order
         let mut queue: VecDeque<(u32, HashMap<U256, u32>, VM)> = VecDeque::new();
-        while !next_traces.is_empty() {        
-            queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
+        for next_trace in next_traces.drain(..) {
+            queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
         }
 
         // only used for simple cfg
@@ -617,8 +617,8 @@ impl VM {
             );
             parent_to_children.entry(parent_id).or_insert(HashSet::new()).insert(node_counter);
             parent_to_children.entry(node_counter).or_insert(HashSet::new());
-            while !next_traces.is_empty() {                
-                queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
+            for next_trace in next_traces.drain(..) {
+                queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
             }
         }        
 
