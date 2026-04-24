@@ -27,7 +27,7 @@ use crate::{
 use eyre::{OptionExt, Result};
 use heimdall_common::utils::strings::decode_hex;
 use std::{collections::HashMap, time::Instant};
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 #[derive(Clone, Debug, Default)]
 pub struct VMTrace {
@@ -469,26 +469,43 @@ impl VM {
         simple_cfg: bool,
         route: Option<Vec<(usize, usize)>>,
     ) -> Result<Option<(VMTrace, VMTraceExtended)>> {         
+        let build_all_traces_start = Instant::now();
+        let route_len = route.as_ref().map(|route| route.len()).unwrap_or(0);
         let mut branch_count: u32 = 0;
         let mut segment_count: u32 = 0;
 
+        let init_jumpdest_start = Instant::now();
         let jumpdest_pc = Self::program_counter(self.bytecode.clone())
             .iter()
             .filter(|(k, v)| v.code == 0x5b)
             .map(|(k, _)| k.clone())
             .collect::<HashSet<U256>>();
+        info!(
+            "[heimdall][phase=build_all_traces.init_jumpdest] route_len={} simple_cfg={} duration_ms={}",
+            route_len,
+            simple_cfg,
+            init_jumpdest_start.elapsed().as_millis()
+        );
 
         let mut node_counter: u32 = 0;
         // this hash means the stack before the instruction is executed
         let root_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
             self.instruction, 
             &self.stack);
+        let initial_route_or_root_trace_start = Instant::now();
         let (root_trace, mut next_traces) = if let Some(route) = route {
             node_counter = Self::generate_safe_node_id_by_route(route.clone());
             self.build_trace_start_from_route(route)?
         } else {
             self.build_trace()?
         };
+        info!(
+            "[heimdall][phase=build_all_traces.initial_route_or_root_trace] route_len={} simple_cfg={} initial_next_traces_len={} duration_ms={}",
+            route_len,
+            simple_cfg,
+            next_traces.len(),
+            initial_route_or_root_trace_start.elapsed().as_millis()
+        );
         let root_node_id = node_counter;
         
         let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
@@ -560,7 +577,10 @@ impl VM {
         // only used for simple cfg
         let mut processed_nodes = HashSet::new();  
         // process the queue until it is empty
-        while !queue.is_empty() {   
+        let queue_expand_start = Instant::now();
+        let mut queue_iterations = 0usize;
+        while !queue.is_empty() {
+            queue_iterations += 1;
             // only check branch and segment limits if we are not building a simple cfg
             if !simple_cfg {
                 if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
@@ -569,7 +589,7 @@ impl VM {
                 if segment_limit.is_some() && segment_count >= segment_limit.unwrap() {
                     return Ok(None);
                 }
-            }            
+            }
             
             let (parent_id, mut previous_trace_hash, mut vm) = queue.pop_front().ok_or_eyre("no next traces")?;
             // this hash means the stack before the instruction is executed
@@ -618,7 +638,16 @@ impl VM {
             while !next_traces.is_empty() {                
                 queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
             }
-        }        
+        }
+        info!(
+            "[heimdall][phase=build_all_traces.queue_expand] route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
+            route_len,
+            simple_cfg,
+            queue_iterations,
+            segment_count,
+            branch_count,
+            queue_expand_start.elapsed().as_millis()
+        );
 
         // always start with the nodes that have no children
         let mut ids = parent_to_children.iter().filter_map(|(parent_id, children)| {
@@ -631,9 +660,11 @@ impl VM {
         
         // sort the ids to ensure we process the nodes in a consistent order
         ids.sort();
+        let final_leaf_count = ids.len();
 
         let mut root_trace: Option<VMTrace> = None;
         let mut root_vm_trace_hash: Option<VMTraceExtended> = None;
+        let reconstruct_tree_start = Instant::now();
         while !ids.is_empty() {            
             let id = ids.pop().ok_or_eyre("no ids")?;            
             // remove parent from the parent_to_children map
@@ -656,7 +687,24 @@ impl VM {
                 root_trace = Some(trace);
                 root_vm_trace_hash = Some(vm_trace_hash);
             }
-        }        
+        }
+        info!(
+            "[heimdall][phase=build_all_traces.reconstruct_tree] route_len={} simple_cfg={} final_leaf_count={} final_node_count={} duration_ms={}",
+            route_len,
+            simple_cfg,
+            final_leaf_count,
+            node_counter.saturating_add(1),
+            reconstruct_tree_start.elapsed().as_millis()
+        );
+        info!(
+            "[heimdall][phase=build_all_traces.total] route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
+            route_len,
+            simple_cfg,
+            queue_iterations,
+            segment_count,
+            branch_count,
+            build_all_traces_start.elapsed().as_millis()
+        );
 
         Ok(Some((root_trace.ok_or_eyre("no root trace")?, root_vm_trace_hash.ok_or_eyre("no root vm trace hash")?)))
     }
@@ -691,6 +739,8 @@ impl VM {
     // each element in the route is a tuple of (start pc in segment, end pc in segment)
     // if the segment only has one instruction, the end pc should be the same as the start pc.
     pub fn build_trace_start_from_route(&mut self, mut route: Vec<(usize, usize)>) -> Result<(VMTrace, Vec<VM>)> {
+        let build_trace_start_from_route_start = Instant::now();
+        let route_len = route.len();
         let mut root_trace = VMTrace {
             instruction: self.instruction,
             gas_used: 0,
@@ -705,7 +755,9 @@ impl VM {
         }
 
         let mut next_traces = Vec::new();
+        let mut step_count = 0usize;
         while self.bytecode.len() >= self.instruction as usize {    
+            step_count += 1;
             let state = self.step()?;
             let last_instruction = state.last_instruction.clone();
             
@@ -813,6 +865,21 @@ impl VM {
         if !route.is_empty() {
             return Err(eyre::eyre!("not all routes were taken"));
         }
+
+        let duration_ms = build_trace_start_from_route_start.elapsed().as_secs_f64() * 1000.0;
+        let ms_per_step = if step_count == 0 {
+            0.0
+        } else {
+            duration_ms / step_count as f64
+        };
+        info!(
+            "[heimdall][phase=build_trace_start_from_route] route_len={} step_count={} next_traces_len={} duration_ms={:.3} ms_per_step={:.6}",
+            route_len,
+            step_count,
+            next_traces.len(),
+            duration_ms,
+            ms_per_step
+        );
 
         Ok((root_trace, next_traces))
     }
