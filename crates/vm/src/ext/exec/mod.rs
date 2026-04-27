@@ -468,6 +468,7 @@ impl VM {
         loop_limit: Option<u32>,
         simple_cfg: bool,
         route: Option<Vec<(usize, usize)>>,
+        processed_nodes: &mut HashSet<U256>,
     ) -> Result<Option<(VMTrace, VMTraceExtended)>> {         
         let build_all_traces_start = Instant::now();
         let route_len = route.as_ref().map(|route| route.len()).unwrap_or(0);
@@ -493,11 +494,12 @@ impl VM {
             self.instruction, 
             &self.stack);
         let initial_route_or_root_trace_start = Instant::now();
-        let (root_trace, mut next_traces) = if let Some(route) = route {
+        let (root_trace, mut next_traces, route_hashes) = if let Some(route) = route {
             node_counter = Self::generate_safe_node_id_by_route(route.clone());
-            self.build_trace_start_from_route(route)?
+            self.build_trace_start_from_route(route, &jumpdest_pc)?
         } else {
-            self.build_trace()?
+            let (t, v) = self.build_trace()?;
+            (t, v, HashMap::new())
         };
         info!(
             "[heimdall][phase=build_all_traces.initial_route_or_root_trace] route_len={} simple_cfg={} initial_next_traces_len={} duration_ms={}",
@@ -547,9 +549,10 @@ impl VM {
         };
         let root_next_possible_segment_hashes = next_possible_segment_hashes_fn(&root_trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?;
 
-        // init the root trace    
-        let mut previous_trace_hash = HashMap::new();
-        previous_trace_hash.insert(root_trace_hash.clone(), 1);  
+        // init the root trace; pre-seed with route segment hashes (S2..Sn) so loop detection
+        // catches BFS branches that back-edge into already-traversed route segments (A1 fix)
+        let mut previous_trace_hash = route_hashes;
+        *previous_trace_hash.entry(root_trace_hash.clone()).or_insert(0) += 1;
 
         // update the branch and segment counts for the root trace
         branch_count += 1;
@@ -574,8 +577,6 @@ impl VM {
             queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
         }
 
-        // only used for simple cfg
-        let mut processed_nodes = HashSet::new();  
         // process the queue until it is empty
         let queue_expand_start = Instant::now();
         let mut queue_iterations = 0usize;
@@ -597,25 +598,32 @@ impl VM {
                 vm.instruction, 
                 &vm.stack);
             let (trace, mut next_traces) = vm.build_trace()?;
-            
+
             // loop detection
-            *previous_trace_hash.entry(current_trace_hash).or_insert(0) += 1;
+            let updated_count = {
+                let count = previous_trace_hash.entry(current_trace_hash).or_insert(0);
+                *count += 1;
+                *count
+            };
             let loop_limit = loop_limit.unwrap_or(1);
-            // validate with loop detection heuristics. if the trace is a loop, skip it                    
-            if *previous_trace_hash.get(&current_trace_hash).ok_or_eyre("no current trace hash")? > loop_limit {
+            // validate with loop detection heuristics. if the trace is a loop, skip it
+            if updated_count > loop_limit {
                 continue;
             }
 
             // if we are building a simple cfg, we only want to process each similar trace once by checking globally
-            if simple_cfg {     
+            if simple_cfg {
+                // loop segments (updated count > 1) that passed loop detection above
+                // should not be additionally blocked; previous_trace_hash + loop_limit govern them
+                let is_known_loop_segment = updated_count > 1;
                 if !processed_nodes.contains(&current_trace_hash) {
                     processed_nodes.insert(current_trace_hash);
-                } else if parent_id == root_node_id {
-                    // If the parent is the root node, we should not skip the trace
+                } else if parent_id == root_node_id || is_known_loop_segment {
+                    // allow: direct child of root, or known loop segment within loop_limit
                 } else {
                     continue;
                 }
-            }   
+            }
 
             if next_traces.len() > 1 {
                 branch_count += 1;
@@ -712,12 +720,13 @@ impl VM {
     pub fn build_all_traces_selector(
         &mut self,
         selector: &str,
-        entry_point: u128,        
+        entry_point: u128,
         branch_limit: Option<u32>,
         segment_limit: Option<u32>,
         loop_limit: Option<u32>,
         simple_cfg: bool,
         route: Option<Vec<(usize, usize)>>,
+        processed_nodes: &mut HashSet<U256>,
     ) -> Result<Option<(VMTrace, VMTraceExtended)>> {
         self.calldata = decode_hex(selector)?;
 
@@ -731,14 +740,14 @@ impl VM {
                 break;
             }
         }
-        
-        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg, route)
+
+        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg, route, processed_nodes)
     }
 
     // build a trace starting from a given route
     // each element in the route is a tuple of (start pc in segment, end pc in segment)
     // if the segment only has one instruction, the end pc should be the same as the start pc.
-    pub fn build_trace_start_from_route(&mut self, mut route: Vec<(usize, usize)>) -> Result<(VMTrace, Vec<VM>)> {
+    pub fn build_trace_start_from_route(&mut self, mut route: Vec<(usize, usize)>, jumpdest_pc: &HashSet<U256>) -> Result<(VMTrace, Vec<VM>, HashMap<U256, u32>)> {
         let build_trace_start_from_route_start = Instant::now();
         let route_len = route.len();
         let mut root_trace = VMTrace {
@@ -755,6 +764,7 @@ impl VM {
         }
 
         let mut next_traces = Vec::new();
+        let mut route_segment_hashes: HashMap<U256, u32> = HashMap::new();
         let mut step_count = 0usize;
         while self.bytecode.len() >= self.instruction as usize {    
             step_count += 1;
@@ -784,7 +794,9 @@ impl VM {
                         } else {
                             return Err(eyre::eyre!("route does not match the last instruction [2]"));
                         }
-                    }                 
+                        let seg_hash = Self::jump_stack_hash_helper(jumpdest_pc, self.instruction, &self.stack);
+                        *route_segment_hashes.entry(seg_hash).or_insert(0) += 1;
+                    }
                 } else {
                     return Err(eyre::eyre!("route does not match the last instruction [3]"));
                 }            
@@ -807,6 +819,8 @@ impl VM {
                         } else {
                             return Err(eyre::eyre!("route does not match the last instruction [4]"));
                         }
+                        let seg_hash = Self::jump_stack_hash_helper(jumpdest_pc, self.instruction, &self.stack);
+                        *route_segment_hashes.entry(seg_hash).or_insert(0) += 1;
                     }
                 } else {
                     return Err(eyre::eyre!("route does not match the last instruction [5]"));
@@ -851,6 +865,8 @@ impl VM {
                         if current_node.0 != self.instruction as usize - 1 {
                             return Err(eyre::eyre!("route does not match the last instruction [6]"));
                         }
+                        let seg_hash = Self::jump_stack_hash_helper(jumpdest_pc, self.instruction, &self.stack);
+                        *route_segment_hashes.entry(seg_hash).or_insert(0) += 1;
                     }
                 } else {
                     return Err(eyre::eyre!("route does not match the last instruction [7]"));
@@ -881,7 +897,7 @@ impl VM {
             ms_per_step
         );
 
-        Ok((root_trace, next_traces))
+        Ok((root_trace, next_traces, route_segment_hashes))
     }
 }
 
