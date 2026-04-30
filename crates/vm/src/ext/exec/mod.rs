@@ -573,8 +573,8 @@ impl VM {
 
         // initialize the queue with the first set of traces
         let mut queue: VecDeque<(u32, HashMap<U256, u32>, VM)> = VecDeque::new();
-        while !next_traces.is_empty() {        
-            queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
+        for next_trace in next_traces.drain(..) {
+            queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
         }
 
         // process the queue until it is empty
@@ -582,6 +582,15 @@ impl VM {
         let mut queue_iterations = 0usize;
         while !queue.is_empty() {
             queue_iterations += 1;
+            if queue_iterations % 1000 == 0 {
+                info!(
+                    "[heimdall][phase=build_all_traces.queue_progress] route_len={} simple_cfg={} queue_iterations={} queue_size={} segment_count={} branch_count={} processed_nodes={} previous_trace_hash={} elapsed_ms={}",
+                    route_len, simple_cfg, queue_iterations, queue.len(),
+                    segment_count, branch_count, processed_nodes.len(),
+                    previous_trace_hash.len(),
+                    queue_expand_start.elapsed().as_millis()
+                );
+            }
             // only check branch and segment limits if we are not building a simple cfg
             if !simple_cfg {
                 if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
@@ -589,6 +598,21 @@ impl VM {
                 }
                 if segment_limit.is_some() && segment_count >= segment_limit.unwrap() {
                     return Ok(None);
+                }
+            } else {
+                if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
+                    warn!(
+                        "[heimdall][phase=build_all_traces.simple_cfg_branch_limit] route_len={} queue_iterations={} branch_count={} limit={} breaking early to avoid OOM",
+                        route_len, queue_iterations, branch_count, branch_limit.unwrap()
+                    );
+                    break;
+                }
+                if segment_limit.is_some() && segment_count >= segment_limit.unwrap() {
+                    warn!(
+                        "[heimdall][phase=build_all_traces.simple_cfg_segment_limit] route_len={} queue_iterations={} segment_count={} limit={} breaking early to avoid OOM",
+                        route_len, queue_iterations, segment_count, segment_limit.unwrap()
+                    );
+                    break;
                 }
             }
             
@@ -643,8 +667,8 @@ impl VM {
             );
             parent_to_children.entry(parent_id).or_insert(HashSet::new()).insert(node_counter);
             parent_to_children.entry(node_counter).or_insert(HashSet::new());
-            while !next_traces.is_empty() {                
-                queue.push_front((node_counter, previous_trace_hash.clone(), next_traces.pop().ok_or_eyre("no next traces")?));   
+            for next_trace in next_traces.drain(..) {
+                queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
             }
         }
         info!(
