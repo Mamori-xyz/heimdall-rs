@@ -27,7 +27,7 @@ use crate::{
 use eyre::{OptionExt, Result};
 use heimdall_common::utils::strings::decode_hex;
 use std::{collections::HashMap, time::Instant};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Clone, Debug, Default)]
 pub struct VMTrace {
@@ -475,18 +475,11 @@ impl VM {
         let mut branch_count: u32 = 0;
         let mut segment_count: u32 = 0;
 
-        let init_jumpdest_start = Instant::now();
         let jumpdest_pc = Self::program_counter(self.bytecode.clone())
             .iter()
             .filter(|(k, v)| v.code == 0x5b)
             .map(|(k, _)| k.clone())
             .collect::<HashSet<U256>>();
-        info!(
-            "[heimdall][phase=build_all_traces.init_jumpdest] route_len={} simple_cfg={} duration_ms={}",
-            route_len,
-            simple_cfg,
-            init_jumpdest_start.elapsed().as_millis()
-        );
 
         let mut node_counter: u32 = 0;
         // this hash means the stack before the instruction is executed
@@ -501,8 +494,8 @@ impl VM {
             let (t, v) = self.build_trace()?;
             (t, v, HashMap::new())
         };
-        info!(
-            "[heimdall][phase=build_all_traces.initial_route_or_root_trace] route_len={} simple_cfg={} initial_next_traces_len={} duration_ms={}",
+        debug!(
+            "[heimdall] initial_root_trace: route_len={} simple_cfg={} initial_next_traces_len={} duration_ms={}",
             route_len,
             simple_cfg,
             next_traces.len(),
@@ -549,8 +542,7 @@ impl VM {
         };
         let root_next_possible_segment_hashes = next_possible_segment_hashes_fn(&root_trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?;
 
-        // init the root trace; pre-seed with route segment hashes (S2..Sn) so loop detection
-        // catches BFS branches that back-edge into already-traversed route segments (A1 fix)
+        // pre-seed route segment hashes so loop detection does not miss them during re-exploration
         let mut previous_trace_hash = route_hashes;
         *previous_trace_hash.entry(root_trace_hash.clone()).or_insert(0) += 1;
 
@@ -583,15 +575,14 @@ impl VM {
         while !queue.is_empty() {
             queue_iterations += 1;
             if queue_iterations % 1000 == 0 {
-                info!(
-                    "[heimdall][phase=build_all_traces.queue_progress] route_len={} simple_cfg={} queue_iterations={} queue_size={} segment_count={} branch_count={} processed_nodes={} previous_trace_hash={} elapsed_ms={}",
+                debug!(
+                    "[heimdall] build_all_traces debug: route_len={} simple_cfg={} queue_iterations={} queue_size={} segment_count={} branch_count={} processed_nodes={} previous_trace_hash={} elapsed_ms={}",
                     route_len, simple_cfg, queue_iterations, queue.len(),
                     segment_count, branch_count, processed_nodes.len(),
                     previous_trace_hash.len(),
                     queue_expand_start.elapsed().as_millis()
                 );
             }
-            // only check branch and segment limits if we are not building a simple cfg
             if !simple_cfg {
                 if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
                     return Ok(None);
@@ -602,14 +593,14 @@ impl VM {
             } else {
                 if branch_limit.is_some() && branch_count >= branch_limit.unwrap() {
                     warn!(
-                        "[heimdall][phase=build_all_traces.simple_cfg_branch_limit] route_len={} queue_iterations={} branch_count={} limit={} breaking early to avoid OOM",
+                        "[heimdall] build_all_traces stop by branch limit: route_len={} queue_iterations={} branch_count={} limit={} breaking early to avoid OOM",
                         route_len, queue_iterations, branch_count, branch_limit.unwrap()
                     );
                     break;
                 }
                 if segment_limit.is_some() && segment_count >= segment_limit.unwrap() {
                     warn!(
-                        "[heimdall][phase=build_all_traces.simple_cfg_segment_limit] route_len={} queue_iterations={} segment_count={} limit={} breaking early to avoid OOM",
+                        "[heimdall] build_all_traces stop by segment limit: route_len={} queue_iterations={} segment_count={} limit={} breaking early to avoid OOM",
                         route_len, queue_iterations, segment_count, segment_limit.unwrap()
                     );
                     break;
@@ -638,7 +629,7 @@ impl VM {
             // if we are building a simple cfg, we only want to process each similar trace once by checking globally
             if simple_cfg {
                 // loop segments (updated count > 1) that passed loop detection above
-                // should not be additionally blocked; previous_trace_hash + loop_limit govern them
+                // should not be additionally blocked
                 let is_known_loop_segment = updated_count > 1;
                 if !processed_nodes.contains(&current_trace_hash) {
                     processed_nodes.insert(current_trace_hash);
@@ -671,8 +662,8 @@ impl VM {
                 queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
             }
         }
-        info!(
-            "[heimdall][phase=build_all_traces.queue_expand] route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
+        debug!(
+            "[heimdall] build_all_traces: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
             route_len,
             simple_cfg,
             queue_iterations,
@@ -692,11 +683,9 @@ impl VM {
         
         // sort the ids to ensure we process the nodes in a consistent order
         ids.sort();
-        let final_leaf_count = ids.len();
 
         let mut root_trace: Option<VMTrace> = None;
         let mut root_vm_trace_hash: Option<VMTraceExtended> = None;
-        let reconstruct_tree_start = Instant::now();
         while !ids.is_empty() {            
             let id = ids.pop().ok_or_eyre("no ids")?;            
             // remove parent from the parent_to_children map
@@ -720,16 +709,9 @@ impl VM {
                 root_vm_trace_hash = Some(vm_trace_hash);
             }
         }
+
         info!(
-            "[heimdall][phase=build_all_traces.reconstruct_tree] route_len={} simple_cfg={} final_leaf_count={} final_node_count={} duration_ms={}",
-            route_len,
-            simple_cfg,
-            final_leaf_count,
-            node_counter.saturating_add(1),
-            reconstruct_tree_start.elapsed().as_millis()
-        );
-        info!(
-            "[heimdall][phase=build_all_traces.total] route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
+            "[heimdall] build_all_traces: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
             route_len,
             simple_cfg,
             queue_iterations,
@@ -912,8 +894,8 @@ impl VM {
         } else {
             duration_ms / step_count as f64
         };
-        info!(
-            "[heimdall][phase=build_trace_start_from_route] route_len={} step_count={} next_traces_len={} duration_ms={:.3} ms_per_step={:.6}",
+        debug!(
+            "[heimdall] build_trace_start_from_route: route_len={} step_count={} next_traces_len={} duration_ms={:.3} ms_per_step={:.6}",
             route_len,
             step_count,
             next_traces.len(),
