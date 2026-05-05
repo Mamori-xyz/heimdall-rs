@@ -2177,6 +2177,7 @@ dependencies = [
  "heimdall-common",
  "indicatif",
  "lazy_static",
+ "libc",
  "rand",
  "reqwest",
  "serde",
