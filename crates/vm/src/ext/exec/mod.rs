@@ -1362,10 +1362,38 @@ impl VM {
         let mut next_traces = Vec::new();
         let mut route_segment_hashes: HashMap<U256, u32> = HashMap::new();
         let mut step_count = 0usize;
+        let mut last_sample_ms = 0f64;
+        {
+            let snap = vm_snapshot_profile(self);
+            let rss_kb = process_peak_rss_kb().unwrap_or(0);
+            debug!(
+                "[heimdall] build_trace_start_from_route init: route_len={} rss_kb={} \
+                 stack_frames={} stack_max_op_depth={} memory_bytes={} storage_slots={}",
+                route_len, rss_kb,
+                snap.stack_frames, snap.stack_max_op_depth,
+                snap.memory_bytes, snap.storage_slots,
+            );
+        }
         while self.bytecode.len() >= self.instruction as usize {
             step_count += 1;
             let state = self.step()?;
             let last_instruction = state.last_instruction.clone();
+
+            if step_count % 1000 == 0 {
+                let elapsed_ms = build_trace_start_from_route_start.elapsed().as_secs_f64() * 1000.0;
+                let snap = vm_snapshot_profile(self);
+                let rss_kb = process_peak_rss_kb().unwrap_or(0);
+                let interval_ms = elapsed_ms - last_sample_ms;
+                last_sample_ms = elapsed_ms;
+                debug!(
+                    "[heimdall] build_trace_start_from_route sample: step={} elapsed_ms={:.0} \
+                     interval_ms={:.0} rss_kb={} stack_frames={} stack_max_op_depth={} \
+                     memory_bytes={} storage_slots={}",
+                    step_count, elapsed_ms, interval_ms, rss_kb,
+                    snap.stack_frames, snap.stack_max_op_depth,
+                    snap.memory_bytes, snap.storage_slots,
+                );
+            }
 
             if last_instruction.opcode == 0x57 { // jumpi
                 if last_instruction.instruction as usize - 1 == current_node.1 {
