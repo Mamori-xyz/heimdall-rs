@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use crate::{
     core::{
-        opcodes::{Opcode, WrappedOpcode},
+        opcodes::{Opcode, WrappedInput, WrappedOpcode},
         stack::Stack,
         vm::{State, VM},
     },
@@ -45,7 +45,11 @@ pub struct VMTraceExtended {
 struct VmSnapshotProfile {
     stack_frames: usize,
     stack_max_op_depth: u32,
+    stack_total_op_nodes: usize,
     memory_bytes: usize,
+    memory_op_entries: usize,
+    memory_max_op_depth: u32,
+    memory_total_op_nodes: usize,
     storage_slots: usize,
     transient_slots: usize,
     event_count: usize,
@@ -113,11 +117,45 @@ fn stack_max_op_depth(stack: &Stack) -> u32 {
     stack.stack.iter().map(|frame| frame.operation.depth()).max().unwrap_or(0)
 }
 
+fn wrapped_opcode_node_count(opcode: &WrappedOpcode) -> usize {
+    1 + opcode.inputs.iter().map(|input| match input {
+        WrappedInput::Opcode(op) => wrapped_opcode_node_count(op),
+        WrappedInput::Raw(_) => 0,
+    }).sum::<usize>()
+}
+
+fn stack_total_op_nodes(stack: &Stack) -> usize {
+    stack.stack.iter().map(|frame| wrapped_opcode_node_count(&frame.operation)).sum()
+}
+
+#[cfg(feature = "experimental")]
+fn memory_max_op_depth(vm: &VM) -> u32 {
+    vm.memory.bytes.0.values().map(|op| op.depth()).max().unwrap_or(0)
+}
+
+#[cfg(feature = "experimental")]
+fn memory_total_op_nodes(vm: &VM) -> usize {
+    vm.memory.bytes.0.values().map(|op| wrapped_opcode_node_count(op)).sum()
+}
+
 fn vm_snapshot_profile(vm: &VM) -> VmSnapshotProfile {
     VmSnapshotProfile {
         stack_frames: vm.stack.stack.len(),
         stack_max_op_depth: stack_max_op_depth(&vm.stack),
+        stack_total_op_nodes: stack_total_op_nodes(&vm.stack),
         memory_bytes: vm.memory.memory.len(),
+        #[cfg(feature = "experimental")]
+        memory_op_entries: vm.memory.bytes.0.len(),
+        #[cfg(not(feature = "experimental"))]
+        memory_op_entries: 0,
+        #[cfg(feature = "experimental")]
+        memory_max_op_depth: memory_max_op_depth(vm),
+        #[cfg(not(feature = "experimental"))]
+        memory_max_op_depth: 0,
+        #[cfg(feature = "experimental")]
+        memory_total_op_nodes: memory_total_op_nodes(vm),
+        #[cfg(not(feature = "experimental"))]
+        memory_total_op_nodes: 0,
         storage_slots: vm.storage.storage.len(),
         transient_slots: vm.storage.transient.len(),
         event_count: vm.events.len(),
@@ -576,6 +614,7 @@ impl VM {
         pc: u128,
         stack: &Stack,
     ) -> U256 {
+        let t_solidify = Instant::now();
         let mut hash_data: Vec<U256> = Vec::new();
         hash_data.push(U256::from(pc));
         for (i, s) in stack.stack.iter().enumerate() {
@@ -585,12 +624,24 @@ impl VM {
                 hash_data.push(s.value);
             }
         }
+        let solidify_ms = t_solidify.elapsed().as_secs_f64() * 1000.0;
 
+        let t_keccak = Instant::now();
         let mut data: Vec<u8> = Vec::new();
         for v in &hash_data {
             data.append(&mut v.to_string().into_bytes());
         }
         let jump_and_jumpi_hash = U256::from(ethers::core::utils::keccak256(&data));
+        let keccak_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+
+        if solidify_ms + keccak_ms > 2000.0 {
+            debug!(
+                "[heimdall] jump_stack_hash_helper: pc={} stack_frames={} \
+                 solidify_ms={:.2} keccak_ms={:.2}",
+                pc, stack.stack.len(), solidify_ms, keccak_ms,
+            );
+        }
+
         jump_and_jumpi_hash
     }
 
@@ -782,6 +833,14 @@ impl VM {
             next_traces.len(),
             initial_route_or_root_trace_start.elapsed().as_millis()
         );
+        {
+            let rss_kb = process_peak_rss_kb().unwrap_or(0);
+            debug!(
+                "[heimdall] build_all_traces post_root_trace: rss_kb={} queue_init={}",
+                rss_kb,
+                next_traces.len(),
+            );
+        }
         let root_node_id = node_counter;
 
         let next_possible_segment_hashes_fn = |trace: &VMTrace| -> Result<HashSet<U256>> {
@@ -855,12 +914,14 @@ impl VM {
         let mut queue_iterations = 0usize;
         while !queue.is_empty() {
             queue_iterations += 1;
-            if queue_iterations % 1000 == 0 {
+            if queue_iterations % 10 == 0 {
+                let rss_kb = process_peak_rss_kb().unwrap_or(0);
                 debug!(
-                    "[heimdall] build_all_traces debug: route_len={} simple_cfg={} queue_iterations={} queue_size={} segment_count={} branch_count={} processed_nodes={} previous_trace_hash={} elapsed_ms={}",
+                    "[heimdall] build_all_traces queue: route_len={} simple_cfg={} queue_iter={} queue_size={} node_entries={} segment_count={} branch_count={} processed_nodes={} rss_kb={} elapsed_ms={}",
                     route_len, simple_cfg, queue_iterations, queue.len(),
+                    node_entries_by_id.len(),
                     segment_count, branch_count, processed_nodes.len(),
-                    previous_trace_hash.len(),
+                    rss_kb,
                     queue_expand_start.elapsed().as_millis()
                 );
             }
@@ -943,15 +1004,21 @@ impl VM {
                 queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
             }
         }
-        debug!(
-            "[heimdall] build_all_traces: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
-            route_len,
-            simple_cfg,
-            queue_iterations,
-            segment_count,
-            branch_count,
-            queue_expand_start.elapsed().as_millis()
-        );
+        {
+            let rss_kb = process_peak_rss_kb().unwrap_or(0);
+            debug!(
+                "[heimdall] build_all_traces post_queue: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} node_entries={} processed_nodes={} rss_kb={} duration_ms={}",
+                route_len,
+                simple_cfg,
+                queue_iterations,
+                segment_count,
+                branch_count,
+                node_entries_by_id.len(),
+                processed_nodes.len(),
+                rss_kb,
+                queue_expand_start.elapsed().as_millis()
+            );
+        }
 
         // always start with the nodes that have no children
         let mut ids = parent_to_children.iter().filter_map(|(parent_id, children)| {
@@ -1363,6 +1430,8 @@ impl VM {
         let mut route_segment_hashes: HashMap<U256, u32> = HashMap::new();
         let mut step_count = 0usize;
         let mut last_sample_ms = 0f64;
+        let mut total_jump_hash_ms = 0f64;
+        let mut jump_hash_call_count = 0usize;
         {
             let snap = vm_snapshot_profile(self);
             let rss_kb = process_peak_rss_kb().unwrap_or(0);
@@ -1384,14 +1453,19 @@ impl VM {
                 let snap = vm_snapshot_profile(self);
                 let rss_kb = process_peak_rss_kb().unwrap_or(0);
                 let interval_ms = elapsed_ms - last_sample_ms;
+                let jump_hash_pct = if elapsed_ms > 0.0 { total_jump_hash_ms / elapsed_ms * 100.0 } else { 0.0 };
                 last_sample_ms = elapsed_ms;
                 debug!(
                     "[heimdall] build_trace_start_from_route sample: step={} elapsed_ms={:.0} \
-                     interval_ms={:.0} rss_kb={} stack_frames={} stack_max_op_depth={} \
-                     memory_bytes={} storage_slots={}",
+                     interval_ms={:.0} rss_kb={} \
+                     stack_frames={} stack_max_op_depth={} stack_total_op_nodes={} \
+                     memory_bytes={} memory_op_entries={} memory_max_op_depth={} memory_total_op_nodes={} \
+                     storage_slots={} jump_hash_calls={} total_jump_hash_ms={:.0} jump_hash_pct={:.1}%",
                     step_count, elapsed_ms, interval_ms, rss_kb,
-                    snap.stack_frames, snap.stack_max_op_depth,
-                    snap.memory_bytes, snap.storage_slots,
+                    snap.stack_frames, snap.stack_max_op_depth, snap.stack_total_op_nodes,
+                    snap.memory_bytes, snap.memory_op_entries, snap.memory_max_op_depth, snap.memory_total_op_nodes,
+                    snap.storage_slots,
+                    jump_hash_call_count, total_jump_hash_ms, jump_hash_pct,
                 );
             }
 
@@ -1418,7 +1492,10 @@ impl VM {
                         } else {
                             return Err(eyre::eyre!("route does not match the last instruction [2]"));
                         }
+                        let _t = Instant::now();
                         let seg_hash = Self::jump_stack_hash_helper(jumpdest_pc, self.instruction, &self.stack);
+                        total_jump_hash_ms += _t.elapsed().as_secs_f64() * 1000.0;
+                        jump_hash_call_count += 1;
                         *route_segment_hashes.entry(seg_hash).or_insert(0) += 1;
                     }
                 } else {
@@ -1443,7 +1520,10 @@ impl VM {
                         } else {
                             return Err(eyre::eyre!("route does not match the last instruction [4]"));
                         }
+                        let _t = Instant::now();
                         let seg_hash = Self::jump_stack_hash_helper(jumpdest_pc, self.instruction, &self.stack);
+                        total_jump_hash_ms += _t.elapsed().as_secs_f64() * 1000.0;
+                        jump_hash_call_count += 1;
                         *route_segment_hashes.entry(seg_hash).or_insert(0) += 1;
                     }
                 } else {
@@ -1489,7 +1569,10 @@ impl VM {
                         if current_node.0 != self.instruction as usize - 1 {
                             return Err(eyre::eyre!("route does not match the last instruction [6]"));
                         }
+                        let _t = Instant::now();
                         let seg_hash = Self::jump_stack_hash_helper(jumpdest_pc, self.instruction, &self.stack);
+                        total_jump_hash_ms += _t.elapsed().as_secs_f64() * 1000.0;
+                        jump_hash_call_count += 1;
                         *route_segment_hashes.entry(seg_hash).or_insert(0) += 1;
                     }
                 } else {
