@@ -914,7 +914,7 @@ impl VM {
         let mut queue_iterations = 0usize;
         while !queue.is_empty() {
             queue_iterations += 1;
-            if queue_iterations % 10 == 0 {
+            if queue_iterations % 500 == 0 {
                 let rss_kb = process_peak_rss_kb().unwrap_or(0);
                 debug!(
                     "[heimdall] build_all_traces queue: route_len={} simple_cfg={} queue_iter={} queue_size={} node_entries={} segment_count={} branch_count={} processed_nodes={} rss_kb={} elapsed_ms={}",
