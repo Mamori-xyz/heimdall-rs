@@ -881,6 +881,8 @@ impl VM {
             Ok(hashes)
         };
         let root_next_possible_segment_hashes = next_possible_segment_hashes_fn(&root_trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?;
+        let mut root_trace = root_trace;
+        let mut trim_profile = trim_trace_for_storage(&mut root_trace);
 
         // pre-seed route segment hashes so loop detection does not miss them during re-exploration
         let mut previous_trace_hash = route_hashes;
@@ -954,7 +956,7 @@ impl VM {
             let current_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
                 vm.instruction, 
                 &vm.stack);
-            let (trace, mut next_traces) = vm.build_trace()?;
+            let (mut trace, mut next_traces) = vm.build_trace()?;
 
             // loop detection
             let updated_count = {
@@ -987,13 +989,19 @@ impl VM {
             }
             segment_count += 1;
             node_counter += 1;
+            let next_possible_segment_hashes = next_possible_segment_hashes_fn(&trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?;
+            let segment_trim_profile = trim_trace_for_storage(&mut trace);
+            trim_profile.original_op_count += segment_trim_profile.original_op_count;
+            trim_profile.retained_op_count += segment_trim_profile.retained_op_count;
+            trim_profile.removed_op_count += segment_trim_profile.removed_op_count;
+            trim_profile.cleared_stack_frames += segment_trim_profile.cleared_stack_frames;
             node_entries_by_id.insert(node_counter,
                 (Some(parent_id),
                     VMTraceExtended {
                         id: node_counter,
                         hash: current_trace_hash,
                         children: Vec::new(),
-                        next_possible_segment_hashes: next_possible_segment_hashes_fn(&trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?,
+                        next_possible_segment_hashes,
                     },
                     trace,
                 ),
@@ -1007,7 +1015,7 @@ impl VM {
         {
             let rss_kb = process_peak_rss_kb().unwrap_or(0);
             debug!(
-                "[heimdall] build_all_traces post_queue: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} node_entries={} processed_nodes={} rss_kb={} duration_ms={}",
+                "[heimdall] build_all_traces post_queue: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} node_entries={} processed_nodes={} trimmed_original_ops={} trimmed_retained_ops={} trimmed_removed_ops={} trimmed_cleared_stack_frames={} rss_kb={} duration_ms={}",
                 route_len,
                 simple_cfg,
                 queue_iterations,
@@ -1015,6 +1023,10 @@ impl VM {
                 branch_count,
                 node_entries_by_id.len(),
                 processed_nodes.len(),
+                trim_profile.original_op_count,
+                trim_profile.retained_op_count,
+                trim_profile.removed_op_count,
+                trim_profile.cleared_stack_frames,
                 rss_kb,
                 queue_expand_start.elapsed().as_millis()
             );
