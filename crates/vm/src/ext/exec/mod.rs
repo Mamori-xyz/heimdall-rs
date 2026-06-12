@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use crate::{
     core::{
         stack::Stack,
-        vm::{State, VM},
+        vm::{Instruction, State, VM},
         opcodes::Opcode
     },
     ext::exec::{
@@ -43,6 +43,66 @@ pub struct VMTraceExtended {
     pub hash: U256,
     pub children: Vec<VMTraceExtended>,
     pub next_possible_segment_hashes: HashSet<U256>,
+    /// Set when this segment ends in a JUMPI whose condition folds to an input-independent
+    /// constant. The CFG builder explores only the feasible successor; this records the decision
+    /// so downstream consumers (e.g. the CFG viewer) can flag that the other direction is a
+    /// statically dead end without re-deriving it. `None` for any non-static or non-JUMPI segment.
+    pub static_jumpi: Option<StaticJumpi>,
+}
+
+/// Records a statically-resolved JUMPI: the branch the CFG builder pruned and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticJumpi {
+    /// The proven-constant condition value the JUMPI folded to.
+    pub condition_value: U256,
+    /// `true`  => the jump target is the live branch (fall-through was pruned).
+    /// `false` => fall-through is the live branch (the jump target was pruned).
+    pub jump_taken: bool,
+    /// EVM PC of the JUMPI's jump target (the JUMPDEST it would land on if taken). Always known
+    /// because the target is a concrete value on the stack.
+    pub jump_target_pc: u128,
+    /// EVM PC of the pruned, statically-unreachable successor's first instruction. For a viewer
+    /// this is the node that was *not* generated, i.e. where the dead-end marker belongs.
+    pub dead_successor_pc: u128,
+}
+
+/// Determine the statically-known outcome of a JUMPI from its last instruction.
+///
+/// At CFG-build time the VM already holds both the concrete condition value (`inputs[1]`) and the
+/// symbolic expression that produced it (`input_operations[1]`). The concrete value only reflects
+/// whatever placeholder calldata the build started with, so it is a *true* static constant only when
+/// the symbolic expression depends on no calldata/storage/memory/environment opcode. When that holds,
+/// the concrete value is the static condition and we can drop the infeasible successor entirely.
+///
+/// - `Some(true)`  => condition is a non-zero constant, JUMPI is always taken (only the jump target
+///   is feasible).
+/// - `Some(false)` => condition is a zero constant, JUMPI is never taken (only fall-through is
+///   feasible).
+/// - `None`        => condition is not a proven constant; both successors must be kept.
+fn jumpi_static_outcome(last_instruction: &Instruction) -> Option<bool> {
+    let condition = last_instruction.input_operations.get(1)?;
+    if !condition.is_constant() {
+        return None;
+    }
+    Some(!last_instruction.inputs.get(1)?.is_zero())
+}
+
+/// Build the [`StaticJumpi`] flag for a finished segment, if it ends in a statically-resolved JUMPI.
+/// Returns `None` for non-JUMPI segments and for JUMPIs whose condition is not a proven constant.
+fn static_jumpi_of_trace(trace: &VMTrace) -> Option<StaticJumpi> {
+    let last_instruction = &trace.operations.last()?.last_instruction;
+    if last_instruction.opcode != 0x57 {
+        return None;
+    }
+    let jump_taken = jumpi_static_outcome(last_instruction)?;
+    let condition_value = *last_instruction.inputs.get(1)?;
+    // EVM PC of each successor's first instruction (heimdall pc == 1-indexed instruction pointer):
+    //   jump target  -> the JUMPDEST value pushed for the jump (inputs[0])
+    //   fall-through -> the instruction immediately after the JUMPI (its 1-indexed pointer)
+    let jump_target_pc = last_instruction.inputs.get(0)?.as_u128();
+    let fall_through_pc = last_instruction.instruction;
+    let dead_successor_pc = if jump_taken { fall_through_pc } else { jump_target_pc };
+    Some(StaticJumpi { condition_value, jump_taken, jump_target_pc, dead_successor_pc })
 }
 
 impl VM {
@@ -429,13 +489,39 @@ impl VM {
             // jump / jumpi
             if last_instruction.opcode == 0x57 || last_instruction.opcode == 0x56 {
                 if last_instruction.opcode == 0x57 {
-                    // continue branch
-                    let mut new_trace = self.clone();
-                    new_trace.instruction = last_instruction.instruction + 1;
-                    next_traces.push(new_trace);
+                    // JUMPI: if the condition folds to an input-independent constant, only the
+                    // feasible successor is generated and the unreachable branch is omitted
+                    // entirely (no successor VM => no node/edge/subtree). Otherwise both branches
+                    // are explored, preserving the original (continue-first, jump-second) order.
+                    match jumpi_static_outcome(&last_instruction) {
+                        Some(true) => {
+                            // always taken: only the jump target is reachable
+                            let mut new_trace = self.clone();
+                            new_trace.instruction = last_instruction.inputs[0].as_u128() + 1;
+                            next_traces.push(new_trace);
+                        }
+                        Some(false) => {
+                            // never taken: only the fall-through is reachable
+                            let mut new_trace = self.clone();
+                            new_trace.instruction = last_instruction.instruction + 1;
+                            next_traces.push(new_trace);
+                        }
+                        None => {
+                            // continue branch
+                            let mut continue_trace = self.clone();
+                            continue_trace.instruction = last_instruction.instruction + 1;
+                            next_traces.push(continue_trace);
+
+                            // jump branch
+                            let mut jump_trace = self.clone();
+                            jump_trace.instruction = last_instruction.inputs[0].as_u128() + 1;
+                            next_traces.push(jump_trace);
+                        }
+                    }
+                    break;
                 }
 
-                // jump branch
+                // unconditional JUMP (0x56): single successor at the jump target
                 let mut new_trace = self.clone();
                 new_trace.instruction = last_instruction.inputs[0].as_u128() + 1;
                 next_traces.push(new_trace);
@@ -509,13 +595,26 @@ impl VM {
             let last_instruction = trace.operations.last().ok_or_eyre("no operations")?.last_instruction.instruction;
             match opcode {
                 0x57_u128 => {
-                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
-                        trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
-                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
-                    hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
-                        last_instruction + 1, 
-                        &trace.operations.last().ok_or_eyre("no operations")?.stack));
-                } 
+                    // Mirror the static-pruning gate applied in `build_trace`: when the JUMPI
+                    // condition is a proven constant, only the feasible successor's hash is listed,
+                    // so `next_possible_segment_hashes` stays consistent with the children actually
+                    // generated.
+                    let op = trace.operations.last().ok_or_eyre("no operations")?;
+                    let jump_target = op.last_instruction.inputs[0].as_u128() + 1;
+                    let fall_through = last_instruction + 1;
+                    match jumpi_static_outcome(&op.last_instruction) {
+                        Some(true) => {
+                            hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc, jump_target, &op.stack));
+                        }
+                        Some(false) => {
+                            hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc, fall_through, &op.stack));
+                        }
+                        None => {
+                            hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc, jump_target, &op.stack));
+                            hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc, fall_through, &op.stack));
+                        }
+                    }
+                }
                 0x56_u128 => {
                     hashes.insert(Self::jump_stack_hash_helper(&jumpdest_pc,
                         trace.operations.last().ok_or_eyre("no operations")?.last_instruction.inputs[0].as_u128() + 1, 
@@ -558,6 +657,7 @@ impl VM {
                 hash: root_trace_hash,
                 children: Vec::new(),
                 next_possible_segment_hashes: root_next_possible_segment_hashes,
+                static_jumpi: static_jumpi_of_trace(&root_trace),
             },
             root_trace,
         ));
@@ -652,6 +752,7 @@ impl VM {
                         hash: current_trace_hash,
                         children: Vec::new(),
                         next_possible_segment_hashes: next_possible_segment_hashes_fn(&trace).map_err(|e| eyre::eyre!("failed to get next possible segment hashes: {}", e))?,
+                        static_jumpi: static_jumpi_of_trace(&trace),
                     },
                     trace,
                 ),
@@ -785,11 +886,27 @@ impl VM {
                             gas_used: self.gas_used,
                             operations: Vec::from([state]),
                             children: Vec::new(),
-                        };                        
-                        self.instruction = last_instruction.instruction + 1;
-                        next_traces.push(self.clone());
-                        self.instruction = last_instruction.inputs[0].as_u128() + 1;
-                        next_traces.push(self.clone());
+                        };
+                        // The route ends exactly on this JUMPI, so both directions are unexplored
+                        // frontier. Apply the same static-pruning gate as the off-route expansion:
+                        // a constant condition means only one side is feasible, so we extend toward
+                        // it alone and never expand the unreachable branch.
+                        match jumpi_static_outcome(&last_instruction) {
+                            Some(true) => {
+                                self.instruction = last_instruction.inputs[0].as_u128() + 1;
+                                next_traces.push(self.clone());
+                            }
+                            Some(false) => {
+                                self.instruction = last_instruction.instruction + 1;
+                                next_traces.push(self.clone());
+                            }
+                            None => {
+                                self.instruction = last_instruction.instruction + 1;
+                                next_traces.push(self.clone());
+                                self.instruction = last_instruction.inputs[0].as_u128() + 1;
+                                next_traces.push(self.clone());
+                            }
+                        }
                         break;
                     } else {
                         current_node = route.pop().ok_or_eyre("no route")?;
@@ -909,5 +1026,99 @@ impl VM {
 
 #[cfg(test)]
 mod tests {
-    // TODO: add tests for symbolic execution & recursive_map
+    use crate::core::vm::VM;
+    use ethers::types::H160;
+
+    // Build a VM over `bytecode` (empty calldata) and run `build_trace`, returning the number of
+    // successor VMs the fork produced.
+    fn successor_count(bytecode: &[u8]) -> usize {
+        let mut vm = VM::new(
+            bytecode,
+            &[],
+            H160::zero(),
+            H160::zero(),
+            H160::zero(),
+            0,
+            1_000_000,
+        );
+        let (_trace, next_traces) = vm.build_trace().expect("build_trace failed");
+        next_traces.len()
+    }
+
+    #[test]
+    fn test_build_trace_prunes_constant_false_jumpi() {
+        // PUSH1 0x00 (cond=0); PUSH1 0x07 (dest); JUMPI; STOP; pad; JUMPDEST; STOP
+        // condition is a zero constant => never taken => only the fall-through successor.
+        let bytecode = [0x60, 0x00, 0x60, 0x07, 0x57, 0x00, 0x00, 0x5b, 0x00];
+        assert_eq!(successor_count(&bytecode), 1);
+    }
+
+    #[test]
+    fn test_build_trace_prunes_constant_true_jumpi() {
+        // PUSH1 0x01 (cond=1); PUSH1 0x07 (dest); JUMPI; STOP; pad; JUMPDEST; STOP
+        // condition is a non-zero constant => always taken => only the jump-target successor.
+        let bytecode = [0x60, 0x01, 0x60, 0x07, 0x57, 0x00, 0x00, 0x5b, 0x00];
+        assert_eq!(successor_count(&bytecode), 1);
+    }
+
+    #[test]
+    fn test_build_trace_keeps_both_for_dynamic_jumpi() {
+        // PUSH1 0x00; CALLDATALOAD (cond depends on input); PUSH1 0x08 (dest); JUMPI; ...
+        // condition is not a proven constant => both successors are explored.
+        let bytecode = [0x60, 0x00, 0x35, 0x60, 0x08, 0x57, 0x00, 0x00, 0x5b, 0x00];
+        assert_eq!(successor_count(&bytecode), 2);
+    }
+
+    // Collect every StaticJumpi flag in a VMTraceExtended tree.
+    fn collect_static_jumpis(ext: &super::VMTraceExtended) -> Vec<super::StaticJumpi> {
+        let mut out = Vec::new();
+        let mut stack = vec![ext];
+        while let Some(node) = stack.pop() {
+            if let Some(sj) = &node.static_jumpi {
+                out.push(sj.clone());
+            }
+            for child in &node.children {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    fn build_all(bytecode: &[u8]) -> super::VMTraceExtended {
+        let mut vm = VM::new(
+            bytecode,
+            &[],
+            H160::zero(),
+            H160::zero(),
+            H160::zero(),
+            0,
+            1_000_000,
+        );
+        let (_trace, ext) = vm
+            .build_all_traces(None, None, None, false, None, &mut std::collections::HashSet::new())
+            .expect("build_all_traces failed")
+            .expect("expected a trace");
+        ext
+    }
+
+    #[test]
+    fn test_static_jumpi_flag_set_for_constant_false() {
+        // condition = 0, dest = 7 => never taken, jump target (pc 7) is the dead successor.
+        let bytecode = [0x60, 0x00, 0x60, 0x07, 0x57, 0x00, 0x00, 0x5b, 0x00];
+        let flags = collect_static_jumpis(&build_all(&bytecode));
+        assert_eq!(flags.len(), 1);
+        assert!(!flags[0].jump_taken);
+        assert_eq!(flags[0].jump_target_pc, 7);
+        // never taken => the dead branch is the jump target (pc 7)
+        assert_eq!(flags[0].dead_successor_pc, 7);
+        assert!(flags[0].condition_value.is_zero());
+    }
+
+    #[test]
+    fn test_static_jumpi_flag_absent_for_dynamic() {
+        // condition from CALLDATALOAD => no static flag anywhere in the tree.
+        let bytecode = [0x60, 0x00, 0x35, 0x60, 0x08, 0x57, 0x00, 0x00, 0x5b, 0x00];
+        let flags = collect_static_jumpis(&build_all(&bytecode));
+        assert!(flags.is_empty());
+    }
 }

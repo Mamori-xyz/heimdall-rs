@@ -212,6 +212,51 @@ impl WrappedOpcode {
     pub fn depth(&self) -> u32 {
         self.inputs.iter().map(|x| x.depth()).max().unwrap_or(0) + 1
     }
+
+    /// Returns `true` if this opcode expression evaluates to an input-independent constant, i.e. it
+    /// is built solely from PUSH literals combined with pure arithmetic/bitwise/comparison opcodes.
+    ///
+    /// Any opcode that reads calldata, storage, memory, the environment, or otherwise depends on
+    /// runtime state (CALLDATALOAD, SLOAD, MLOAD, KECCAK256, CALLER, ADDMOD/MULMOD, CALL*, …) makes
+    /// the expression non-constant. This mirrors the pure-opcode allow-list used by mamori's
+    /// `try_evaluate_constant_op`, and lets the CFG builder treat a JUMPI condition as statically
+    /// determined when it folds to a constant.
+    pub fn is_constant(&self) -> bool {
+        let pure = matches!(
+            self.opcode.code,
+            // PUSH0..=PUSH32
+            0x5F..=0x7F
+            // Binary arithmetic
+            | 0x01 // ADD
+            | 0x03 // SUB
+            | 0x02 // MUL
+            | 0x04 // DIV
+            | 0x06 // MOD
+            | 0x05 // SDIV
+            | 0x07 // SMOD
+            | 0x0a // EXP
+            // Comparison
+            | 0x10 // LT
+            | 0x11 // GT
+            | 0x12 // SLT
+            | 0x13 // SGT
+            | 0x14 // EQ
+            | 0x15 // ISZERO
+            // Bitwise
+            | 0x16 // AND
+            | 0x17 // OR
+            | 0x18 // XOR
+            | 0x19 // NOT
+            // Shifts
+            | 0x1b // SHL
+            | 0x1c // SHR
+            | 0x1d // SAR
+            // Byte / sign-extend
+            | 0x1a // BYTE
+            | 0x0b // SIGNEXTEND
+        );
+        pure && self.inputs.iter().all(|input| input.is_constant())
+    }
 }
 
 impl WrappedInput {
@@ -231,6 +276,15 @@ impl WrappedInput {
         match self {
             WrappedInput::Raw(_) => 0,
             WrappedInput::Opcode(opcode) => opcode.depth(),
+        }
+    }
+
+    /// Returns `true` if this input is an input-independent constant. A raw value is always
+    /// constant; a wrapped opcode is constant iff [`WrappedOpcode::is_constant`] holds.
+    pub fn is_constant(&self) -> bool {
+        match self {
+            WrappedInput::Raw(_) => true,
+            WrappedInput::Opcode(opcode) => opcode.is_constant(),
         }
     }
 }
@@ -288,5 +342,57 @@ mod tests {
         let calldataload_wrapped =
             WrappedOpcode::new(0x35, vec![WrappedInput::Opcode(add_operation_wrapped)]);
         println!("{}", calldataload_wrapped);
+    }
+
+    #[test]
+    fn test_is_constant_raw_and_push() {
+        // a raw value is always constant
+        assert!(WrappedInput::Raw(U256::from(42u8)).is_constant());
+
+        // PUSH1 0x01 -> constant
+        let push = WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))]);
+        assert!(push.is_constant());
+        assert!(WrappedInput::Opcode(push).is_constant());
+    }
+
+    #[test]
+    fn test_is_constant_pure_arithmetic_tree() {
+        // ISZERO(EQ(PUSH1 1, PUSH1 1)) -> fully constant
+        let eq = WrappedOpcode::new(
+            0x14, // EQ
+            vec![
+                WrappedInput::Opcode(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))])),
+                WrappedInput::Opcode(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))])),
+            ],
+        );
+        let iszero = WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(eq)]);
+        assert!(iszero.is_constant());
+    }
+
+    #[test]
+    fn test_is_constant_state_dependent_is_not_constant() {
+        // CALLDATALOAD(PUSH1 0) -> not constant (reads input)
+        let calldataload = WrappedOpcode::new(
+            0x35,
+            vec![WrappedInput::Opcode(WrappedOpcode::new(0x5f, vec![]))],
+        );
+        assert!(!calldataload.is_constant());
+
+        // ISZERO(CALLDATALOAD(..)) -> the impure leaf taints the whole tree
+        let iszero =
+            WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(calldataload)]);
+        assert!(!iszero.is_constant());
+
+        // SLOAD and ADDMOD are also impure for our purposes
+        assert!(!WrappedOpcode::new(0x54, vec![WrappedInput::Raw(U256::zero())]).is_constant());
+        assert!(!WrappedOpcode::new(
+            0x08, // ADDMOD
+            vec![
+                WrappedInput::Raw(U256::from(1u8)),
+                WrappedInput::Raw(U256::from(2u8)),
+                WrappedInput::Raw(U256::from(3u8)),
+            ]
+        )
+        .is_constant());
     }
 }
