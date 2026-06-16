@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     ops::{Div, Rem, Shl, Shr},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -33,8 +34,8 @@ use super::{
 #[derive(Clone, Debug)]
 pub struct VM {
     pub stack: Stack,
-    pub memory: Memory,
-    pub storage: Storage,
+    pub memory: Arc<Memory>,
+    pub storage: Arc<Storage>,
     pub instruction: u128,
     pub bytecode: Vec<u8>,
     pub calldata: Vec<u8>,
@@ -44,7 +45,7 @@ pub struct VM {
     pub value: u128,
     pub gas_remaining: u128,
     pub gas_used: u128,
-    pub events: Vec<Log>,
+    pub events: Arc<Vec<Log>>,
     pub returndata: Vec<u8>,
     pub exitcode: u128,
     pub address_access_set: HashSet<U256>,
@@ -73,9 +74,9 @@ pub struct State {
     pub gas_used: u128,
     pub gas_remaining: u128,
     pub stack: Stack,
-    pub memory: Memory,
-    pub storage: Storage,
-    pub events: Vec<Log>,
+    pub memory: Arc<Memory>,
+    pub storage: Arc<Storage>,
+    pub events: Arc<Vec<Log>>,
 }
 
 /// [`Instruction`] is a single EVM instruction. It is returned by the [`VM::step`] function, and
@@ -139,8 +140,8 @@ impl VM {
     ) -> VM {
         VM {
             stack: Stack::new(),
-            memory: Memory::new(),
-            storage: Storage::new(),
+            memory: Arc::new(Memory::new()),
+            storage: Arc::new(Storage::new()),
             instruction: 1,
             bytecode: bytecode.to_vec(),
             calldata: calldata.to_vec(),
@@ -150,7 +151,7 @@ impl VM {
             value,
             gas_remaining: gas_limit.max(21000) - 21000,
             gas_used: 21000,
-            events: Vec::new(),
+            events: Arc::new(Vec::new()),
             returndata: Vec::new(),
             exitcode: 255,
             address_access_set: HashSet::new(),
@@ -879,7 +880,7 @@ impl VM {
                 let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -921,7 +922,7 @@ impl VM {
                 let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -977,7 +978,7 @@ impl VM {
                     self.consume_gas(100);
                 }
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -1011,7 +1012,7 @@ impl VM {
                     3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(dest_offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -1094,7 +1095,7 @@ impl VM {
                 let gas_cost = self.memory.expansion_cost(offset, 32);
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     offset,
                     32,
                     value.encode().as_slice(),
@@ -1115,7 +1116,7 @@ impl VM {
                 let gas_cost = self.memory.expansion_cost(offset, 1);
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     offset,
                     1,
                     &[value.encode()[31]],
@@ -1129,10 +1130,11 @@ impl VM {
                 let key = self.stack.pop()?.value;
 
                 // consume dynamic gas
-                let gas_cost = self.storage.access_cost(key.into());
+                let gas_cost = Arc::make_mut(&mut self.storage).access_cost(key.into());
                 self.consume_gas(gas_cost);
 
-                self.stack.push(U256::from(self.storage.load(key.into())), operation)
+                let value = Arc::make_mut(&mut self.storage).load(key.into());
+                self.stack.push(U256::from(value), operation)
             }
 
             // SSTORE
@@ -1141,10 +1143,10 @@ impl VM {
                 let value = self.stack.pop()?.value;
 
                 // consume dynamic gas
-                let gas_cost = self.storage.storage_cost(key.into(), value.into());
+                let gas_cost = Arc::make_mut(&mut self.storage).storage_cost(key.into(), value.into());
                 self.consume_gas(gas_cost);
 
-                self.storage.store(key.into(), value.into());
+                Arc::make_mut(&mut self.storage).store(key.into(), value.into());
             }
 
             // JUMP
@@ -1217,14 +1219,15 @@ impl VM {
             // TLOAD
             0x5C => {
                 let key = self.stack.pop()?.value;
-                self.stack.push(U256::from(self.storage.tload(key.into())), operation)
+                let value = Arc::make_mut(&mut self.storage).tload(key.into());
+                self.stack.push(U256::from(value), operation)
             }
 
             // TSTORE
             0x5D => {
                 let key = self.stack.pop()?.value;
                 let value = self.stack.pop()?.value;
-                self.storage.tstore(key.into(), value.into());
+                Arc::make_mut(&mut self.storage).tstore(key.into(), value.into());
             }
 
             // MCOPY
@@ -1253,7 +1256,7 @@ impl VM {
                 let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -1341,14 +1344,12 @@ impl VM {
 
                 // no need for a panic check because the length of events should never be larger
                 // than a u128
-                self.events.push(Log::new(
-                    self.events
-                        .len()
-                        .try_into()
-                        .expect("impossible case: log_index is larger than u128::MAX"),
-                    topics,
-                    &data,
-                ))
+                let log_index = self
+                    .events
+                    .len()
+                    .try_into()
+                    .expect("impossible case: log_index is larger than u128::MAX");
+                Arc::make_mut(&mut self.events).push(Log::new(log_index, topics, &data))
             }
 
             // CREATE
@@ -1566,11 +1567,11 @@ impl VM {
     /// ```
     pub fn reset(&mut self) {
         self.stack = Stack::new();
-        self.memory = Memory::new();
+        self.memory = Arc::new(Memory::new());
         self.instruction = 1;
         self.gas_remaining = (self.gas_used + self.gas_remaining).max(21000) - 21000;
         self.gas_used = 21000;
-        self.events = Vec::new();
+        self.events = Arc::new(Vec::new());
         self.returndata = Vec::new();
         self.exitcode = 255;
     }
@@ -1608,7 +1609,7 @@ impl VM {
             gas_remaining: self.gas_remaining,
             returndata: self.returndata.to_owned(),
             exitcode: self.exitcode,
-            events: self.events.clone(),
+            events: (*self.events).clone(),
             instruction: self.instruction,
         })
     }

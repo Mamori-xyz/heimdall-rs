@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ethers::types::U256;
 use heimdall_common::constants::{MEMORY_REGEX, STORAGE_REGEX};
@@ -11,7 +12,7 @@ use super::jump_frame::JumpFrame;
 /// Given two stacks A and B, return A - B, i.e. the items in A that are not in B.
 /// This operation takes order into account, so if A = [1, 2, 3] and B = [1, 3, 2], then A - B =
 /// [2]. This is referred to as the "stack diff"
-pub fn stack_diff(a: &Stack, b: &Stack) -> Vec<StackFrame> {
+pub fn stack_diff(a: &Stack, b: &Stack) -> Vec<Arc<StackFrame>> {
     let mut diff = Vec::new();
 
     for (i, frame) in a.stack.iter().enumerate() {
@@ -95,7 +96,10 @@ pub fn stack_item_source_depth_too_deep(stack: &Stack) -> bool {
 
 /// Compare the stack diff to the given jump condition and determine if the jump condition appears
 /// to be the condition of a loop.
-pub fn jump_condition_appears_recursive(stack_diff: &[StackFrame], jump_condition: &str) -> bool {
+pub fn jump_condition_appears_recursive(
+    stack_diff: &[Arc<StackFrame>],
+    jump_condition: &str,
+) -> bool {
     // check if the jump condition appears in the stack diff more than once, this is likely a loop
     if stack_diff
         .iter()
@@ -111,7 +115,7 @@ pub fn jump_condition_appears_recursive(stack_diff: &[StackFrame], jump_conditio
 
 /// Check if the jump condition contains a memory access that is modified within the stack diff.
 pub fn jump_condition_contains_mutated_memory_access(
-    stack_diff: &[StackFrame],
+    stack_diff: &[Arc<StackFrame>],
     jump_condition: &str,
 ) -> bool {
     let mut memory_accesses = MEMORY_REGEX.find_iter(jump_condition);
@@ -139,7 +143,7 @@ pub fn jump_condition_contains_mutated_memory_access(
 
 /// Check if the jump condition contains a storage access that is modified within the stack diff.
 pub fn jump_condition_contains_mutated_storage_access(
-    stack_diff: &[StackFrame],
+    stack_diff: &[Arc<StackFrame>],
     jump_condition: &str,
 ) -> bool {
     let mut storage_accesses = STORAGE_REGEX.find_iter(jump_condition);

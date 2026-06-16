@@ -404,12 +404,15 @@ impl VM {
     ) -> U256 {
         let mut hash_data: Vec<U256> = Vec::new();
         hash_data.push(U256::from(pc));        
-        for (i, s) in stack.stack.iter().enumerate() {        
-            let solidified_operation = s.operation.solidify();
-            if jump_dest_pc.contains(&s.value) && solidified_operation.starts_with("0x") && !solidified_operation.contains(" ") {
+        for (i, s) in stack.stack.iter().enumerate() {
+            // PUSH1–PUSH32 (0x60–0x7F) solidify to a plain "0x..." literal with no spaces.
+            // Checking the opcode code directly is O(1) vs O(tree_depth) for solidify(),
+            // which becomes expensive as expression trees deepen over long routes.
+            let is_push_const = matches!(s.operation.opcode.code, 0x60..=0x7F);
+            if jump_dest_pc.contains(&s.value) && is_push_const {
                 hash_data.push(U256::from(i));
-                hash_data.push(s.value);                            
-            }            
+                hash_data.push(s.value);
+            }
         }
     
         let mut data: Vec<u8> = Vec::new();
@@ -644,6 +647,14 @@ impl VM {
         // pre-seed route segment hashes so loop detection does not miss them during re-exploration
         let mut previous_trace_hash = route_hashes;
         *previous_trace_hash.entry(root_trace_hash.clone()).or_insert(0) += 1;
+        // compute effective loop limit relative to the route's own repeat depth so
+        // that the cap is always "N extra iterations from the frontier", not an
+        // absolute count that gets blocked by the pre-seeded route counts.
+        let global_limit = loop_limit.unwrap_or(4);
+        // One-more-produce threshold: always allow one new visit beyond the route's
+        // own repeat depth. As the route grows on every extend call, route_max_count
+        // increments too, so each successive extend naturally gets its own "+1".
+        let route_max_count = previous_trace_hash.values().max().copied().unwrap_or(0);
 
         // update the branch and segment counts for the root trace
         branch_count += 1;
@@ -720,9 +731,11 @@ impl VM {
                 *count += 1;
                 *count
             };
-            let loop_limit = loop_limit.unwrap_or(1);
-            // validate with loop detection heuristics. if the trace is a loop, skip it
-            if updated_count > loop_limit {
+            // can_produce: still add this node to CFG (one new visit beyond route depth)
+            // can_expand: push children to queue only when within global limit
+            let can_produce = updated_count <= route_max_count + 1;
+            let skip_children = updated_count > global_limit;
+            if !can_produce {
                 continue;
             }
 
@@ -759,12 +772,14 @@ impl VM {
             );
             parent_to_children.entry(parent_id).or_insert(HashSet::new()).insert(node_counter);
             parent_to_children.entry(node_counter).or_insert(HashSet::new());
-            for next_trace in next_traces.drain(..) {
-                queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
+            if !skip_children {
+                for next_trace in next_traces.drain(..) {
+                    queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
+                }
             }
         }
-        debug!(
-            "[heimdall] build_all_traces: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
+        info!(
+            "[heimdall] build_all_traces queue_expand: route_len={} simple_cfg={} queue_iterations={} segment_count={} branch_count={} duration_ms={}",
             route_len,
             simple_cfg,
             queue_iterations,
@@ -1011,7 +1026,7 @@ impl VM {
         } else {
             duration_ms / step_count as f64
         };
-        debug!(
+        info!(
             "[heimdall] build_trace_start_from_route: route_len={} step_count={} next_traces_len={} duration_ms={:.3} ms_per_step={:.6}",
             route_len,
             step_count,
