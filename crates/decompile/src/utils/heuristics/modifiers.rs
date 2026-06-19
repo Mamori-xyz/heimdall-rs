@@ -61,7 +61,7 @@ pub fn modifier_heuristic(
         state.last_instruction.input_operations[1] ==
             WrappedOpcode::new(
                 0x15,
-                vec![WrappedInput::Opcode(WrappedOpcode::new(0x34, vec![]))],
+                vec![WrappedInput::Opcode(std::sync::Arc::new(WrappedOpcode::new(0x34, vec![])))],
             )
     {
         debug!(

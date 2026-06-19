@@ -284,10 +284,11 @@ impl VM {
         let gas_cost = opcode_details.mingas;
         self.consume_gas(gas_cost.into());
 
-        // convert inputs to WrappedInputs
+        // convert inputs to WrappedInputs. Arc-wrap each operand so the new opcode shares the
+        // operand subtrees by reference instead of deep-copying them (see WrappedInput docs).
         let wrapped_inputs = input_operations
             .iter()
-            .map(|x| WrappedInput::Opcode(x.to_owned()))
+            .map(|x| WrappedInput::Opcode(Arc::new(x.to_owned())))
             .collect::<Vec<WrappedInput>>();
         let mut operation = WrappedOpcode::new(opcode, wrapped_inputs);
 

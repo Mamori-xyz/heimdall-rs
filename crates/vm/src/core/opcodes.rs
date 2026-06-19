@@ -1,5 +1,6 @@
 use ethers::types::U256;
 use std::fmt::{Display, Formatter, Result};
+use std::sync::Arc;
 
 /// An [`Opcode`] represents an Ethereum Virtual Machine (EVM) opcode. \
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -177,11 +178,17 @@ impl Opcode {
     }
 }
 
-/// A WrappedInput can contain either a raw U256 value or a WrappedOpcode
+/// A WrappedInput can contain either a raw U256 value or a WrappedOpcode.
+///
+/// The nested opcode is held behind an `Arc` so that combining expressions (e.g. building
+/// `ADD(a, b)` from two stack operands) shares the operand subtrees by reference-count bump instead
+/// of deep-copying them. This makes `WrappedOpcode::clone()` shallow (top node + Arc-bumped
+/// children) and turns a strictly-deepening accumulator like `ADD(ADD(ADD(…)))` from O(N²)
+/// time/memory (every step deep-copies the growing tree) into O(N) with shared subtrees.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WrappedInput {
     Raw(U256),
-    Opcode(WrappedOpcode),
+    Opcode(Arc<WrappedOpcode>),
 }
 
 /// A WrappedOpcode is an Opcode with its inputs wrapped in a WrappedInput
@@ -269,7 +276,7 @@ impl WrappedInput {
     /// let opcode = WrappedOpcode::new(0x01, vec![WrappedInput::Raw(1.into()), WrappedInput::Raw(2.into())]);
     /// assert_eq!(opcode.depth(), 1);
     ///
-    /// let input = WrappedInput::Opcode(opcode);
+    /// let input = WrappedInput::Opcode(std::sync::Arc::new(opcode));
     /// assert_eq!(input.depth(), 1);
     /// ```
     pub fn depth(&self) -> u32 {
@@ -304,7 +311,7 @@ impl Display for WrappedInput {
     fn fmt(&self, f: &mut Formatter) -> Result {
         match self {
             WrappedInput::Raw(u256) => write!(f, "{u256}"),
-            WrappedInput::Opcode(opcode) => write!(f, "{opcode}"),
+            WrappedInput::Opcode(opcode) => write!(f, "{}", opcode.as_ref()),
         }
     }
 }
@@ -313,6 +320,7 @@ impl Display for WrappedInput {
 mod tests {
     use crate::core::opcodes::Opcode;
     use ethers::types::U256;
+    use std::sync::Arc;
 
     use crate::core::opcodes::{WrappedInput, WrappedOpcode};
 
@@ -340,7 +348,7 @@ mod tests {
 
         // wraps a CALLDATALOAD operation
         let calldataload_wrapped =
-            WrappedOpcode::new(0x35, vec![WrappedInput::Opcode(add_operation_wrapped)]);
+            WrappedOpcode::new(0x35, vec![WrappedInput::Opcode(Arc::new(add_operation_wrapped))]);
         println!("{}", calldataload_wrapped);
     }
 
@@ -352,7 +360,7 @@ mod tests {
         // PUSH1 0x01 -> constant
         let push = WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))]);
         assert!(push.is_constant());
-        assert!(WrappedInput::Opcode(push).is_constant());
+        assert!(WrappedInput::Opcode(Arc::new(push)).is_constant());
     }
 
     #[test]
@@ -361,11 +369,11 @@ mod tests {
         let eq = WrappedOpcode::new(
             0x14, // EQ
             vec![
-                WrappedInput::Opcode(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))])),
-                WrappedInput::Opcode(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))])),
+                WrappedInput::Opcode(Arc::new(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))]))),
+                WrappedInput::Opcode(Arc::new(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))]))),
             ],
         );
-        let iszero = WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(eq)]);
+        let iszero = WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(Arc::new(eq))]);
         assert!(iszero.is_constant());
     }
 
@@ -374,13 +382,13 @@ mod tests {
         // CALLDATALOAD(PUSH1 0) -> not constant (reads input)
         let calldataload = WrappedOpcode::new(
             0x35,
-            vec![WrappedInput::Opcode(WrappedOpcode::new(0x5f, vec![]))],
+            vec![WrappedInput::Opcode(Arc::new(WrappedOpcode::new(0x5f, vec![])))],
         );
         assert!(!calldataload.is_constant());
 
         // ISZERO(CALLDATALOAD(..)) -> the impure leaf taints the whole tree
         let iszero =
-            WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(calldataload)]);
+            WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(Arc::new(calldataload))]);
         assert!(!iszero.is_constant());
 
         // SLOAD and ADDMOD are also impure for our purposes
