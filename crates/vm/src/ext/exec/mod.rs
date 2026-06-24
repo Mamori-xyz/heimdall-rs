@@ -1,5 +1,10 @@
 mod jump_frame;
+mod stream;
 mod util;
+
+pub use stream::{
+    BranchKind, ChildEdge, InputRef, StreamSegment, StreamStep, StreamSummary, TraceSink,
+};
 
 use std::{cell::RefCell, sync::Arc};
 use ethers::abi::AbiEncode;
@@ -51,7 +56,7 @@ pub struct VMTraceExtended {
 }
 
 /// Records a statically-resolved JUMPI: the branch the CFG builder pruned and why.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StaticJumpi {
     /// The proven-constant condition value the JUMPI folded to.
     pub condition_value: U256,
@@ -558,14 +563,6 @@ impl VM {
         simple_cfg: bool,
         route: Option<Vec<(usize, usize)>>,
         processed_nodes: &mut HashSet<U256>,
-        // RESUME: when Some(loop_hashes), `self` is a cached VM positioned at the start of the
-        // route end node's segment, so the full route replay is skipped (see root construction).
-        // `route` is still passed (for the node id) so the resumed subtree is byte-identical to the
-        // route-replay path; `loop_hashes` is the cached loop-detection state for that node.
-        resume_hashes: Option<HashMap<U256, u32>>,
-        // VM-resume cache: when Some, every explored BFS node's start VM + loop-detection map is
-        // recorded under its assigned node id so a later extend can resume from it.
-        mut node_vm_cache: Option<&mut HashMap<u32, (VM, HashMap<U256, u32>)>>,
     ) -> Result<Option<(VMTrace, VMTraceExtended)>> {
         let build_all_traces_start = Instant::now();
         let route_len = route.as_ref().map(|route| route.len()).unwrap_or(0);
@@ -584,22 +581,7 @@ impl VM {
             self.instruction, 
             &self.stack);
         let initial_route_or_root_trace_start = Instant::now();
-        let (root_trace, mut next_traces, route_hashes) = if let Some(resume_hashes) = resume_hashes {
-            // RESUME: `self` is the cached VM at the start of the route end node's segment, so a
-            // single build_trace emits this node's segment and its successor VMs — exactly what
-            // build_trace_start_from_route would produce for a route ending here, but without
-            // re-executing the whole route. The node id is still derived from the route, so the
-            // resumed subtree is byte-identical to the route-replay path (same ids, hashes, ops).
-            // `root_trace_hash` (computed above from `self`) is this node's segment-start hash, and
-            // `resume_hashes` is the popped previous_trace_hash from when this node was first
-            // discovered (before its own increment); the `+= 1` at root_trace_hash below restores
-            // the exact loop-detection state the route path would have.
-            if let Some(route) = route.as_ref() {
-                node_counter = Self::generate_safe_node_id_by_route(route.clone());
-            }
-            let (t, v) = self.build_trace()?;
-            (t, v, resume_hashes)
-        } else if let Some(route) = route {
+        let (root_trace, mut next_traces, route_hashes) = if let Some(route) = route {
             node_counter = Self::generate_safe_node_id_by_route(route.clone());
             self.build_trace_start_from_route(route, &jumpdest_pc)?
         } else {
@@ -684,12 +666,6 @@ impl VM {
         segment_count += 1;
 
         let mut parent_to_children: HashMap<u32, HashSet<u32>> = HashMap::new();
-        // Resume cache bookkeeping: per cached node, how many of its expected successors are still
-        // unfilled. A node is evicted from the cache only when this reaches 0 (fully expanded); a
-        // node still missing a branch stays cached, because the driver may extend it to force that
-        // branch. Leaves (skip_children / loop frontier) never get their count decremented, so they
-        // stay too. Only meaningful when node_vm_cache is Some.
-        let mut cache_remaining_children: HashMap<u32, usize> = HashMap::new();
         let mut node_entries_by_id: HashMap<u32, (Option<u32>, VMTraceExtended, VMTrace)> = HashMap::new(); // (parent_id, trace_hash, trace)
         node_entries_by_id.insert(node_counter, (None,
             VMTraceExtended {
@@ -752,13 +728,6 @@ impl VM {
             let current_trace_hash = Self::jump_stack_hash_helper(&jumpdest_pc,
                 vm.instruction,
                 &vm.stack);
-            // VM-resume cache: snapshot this node's start VM + loop-detection map *before*
-            // build_trace mutates the VM. The snapshot is transient (one live at a time) and is only
-            // *committed* under the node id if the node turns out to be a frontier leaf (see below) —
-            // so the heavy retention is bounded to leaves, not every explored node.
-            let cache_snapshot = node_vm_cache
-                .as_ref()
-                .map(|_| (vm.clone(), previous_trace_hash.clone()));
             let (trace, mut next_traces) = vm.build_trace()?;
 
             // loop detection
@@ -808,33 +777,6 @@ impl VM {
             );
             parent_to_children.entry(parent_id).or_insert(HashSet::new()).insert(node_counter);
             parent_to_children.entry(node_counter).or_insert(HashSet::new());
-            // Resume cache, provisional-with-eviction-when-fully-expanded. The driver extends a node
-            // when its on-path successor isn't a child yet — i.e. a node that is still missing at
-            // least one successor: a frontier leaf (no successors explored) OR a branch that has one
-            // side but not the other (the other was cut by a loop/dedup gate). So: cache every node
-            // with successors when it's added, and decrement its parent's remaining-successor count;
-            // evict the parent only once ALL its expected successors have been added (it's fully
-            // expanded and will never be extended). What survives the round are exactly the
-            // not-fully-expanded nodes (leaves + partial branches) — the extend targets — while peak
-            // retention stays near the open BFS frontier rather than every explored node (which OOM'd).
-            // node_counter equals the VMTraceExtended.id mamori convert assigns, i.e. the cache key
-            // the driver passes back.
-            if let Some(cache) = node_vm_cache.as_deref_mut() {
-                if let Some(rem) = cache_remaining_children.get_mut(&parent_id) {
-                    *rem = rem.saturating_sub(1);
-                    if *rem == 0 {
-                        cache.remove(&parent_id);
-                        cache_remaining_children.remove(&parent_id);
-                    }
-                }
-                // A terminal node (no successors) can never be extended, so don't cache it.
-                if !next_traces.is_empty() {
-                    if let Some(snapshot) = cache_snapshot {
-                        cache.insert(node_counter, snapshot);
-                        cache_remaining_children.insert(node_counter, next_traces.len());
-                    }
-                }
-            }
             if !skip_children {
                 for next_trace in next_traces.drain(..) {
                     queue.push_back((node_counter, previous_trace_hash.clone(), next_trace));
@@ -912,7 +854,6 @@ impl VM {
         simple_cfg: bool,
         route: Option<Vec<(usize, usize)>>,
         processed_nodes: &mut HashSet<U256>,
-        node_vm_cache: Option<&mut HashMap<u32, (VM, HashMap<U256, u32>)>>,
     ) -> Result<Option<(VMTrace, VMTraceExtended)>> {
         self.calldata = decode_hex(selector)?;
 
@@ -927,9 +868,7 @@ impl VM {
             }
         }
 
-        // The selector path never resumes (it always starts from the entry point); resuming is
-        // dispatched by the caller directly to build_all_traces with the cached VM.
-        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg, route, processed_nodes, /*resume_hashes*/ None, node_vm_cache)
+        self.build_all_traces(branch_limit, segment_limit, loop_limit, simple_cfg, route, processed_nodes)
     }
 
     // build a trace starting from a given route
@@ -1176,7 +1115,7 @@ mod tests {
             1_000_000,
         );
         let (_trace, ext) = vm
-            .build_all_traces(None, None, None, false, None, &mut std::collections::HashSet::new(), None, None)
+            .build_all_traces(None, None, None, false, None, &mut std::collections::HashSet::new())
             .expect("build_all_traces failed")
             .expect("expected a trace");
         ext
