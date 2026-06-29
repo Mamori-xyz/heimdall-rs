@@ -49,6 +49,11 @@ pub struct VM {
     pub returndata: Vec<u8>,
     pub exitcode: u128,
     pub address_access_set: HashSet<U256>,
+    /// The most recent CALL/STATICCALL's [`WrappedOpcode`], used to tag return-data memory
+    /// (RETURNDATACOPY / inline ret-range) with the originating call so a later read can be
+    /// attributed without replaying the call's segment.
+    #[cfg(feature = "experimental")]
+    pub returndata_source: Option<WrappedOpcode>,
     #[cfg(feature = "step-tracing")]
     pub operation_count: u128,
     #[cfg(feature = "step-tracing")]
@@ -155,6 +160,8 @@ impl VM {
             returndata: Vec::new(),
             exitcode: 255,
             address_access_set: HashSet::new(),
+            #[cfg(feature = "experimental")]
+            returndata_source: None,
             #[cfg(feature = "step-tracing")]
             operation_count: 0,
             #[cfg(feature = "step-tracing")]
@@ -1013,12 +1020,17 @@ impl VM {
                     3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(dest_offset, size));
                 self.consume_gas(gas_cost);
 
+                // Tag the copied region with the originating CALL (not RETURNDATACOPY itself), so a
+                // later reader can attribute it to that external call's return data.
+                #[cfg(feature = "experimental")]
+                let provenance =
+                    self.returndata_source.clone().unwrap_or_else(|| operation.clone());
                 Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
                     #[cfg(feature = "experimental")]
-                    operation,
+                    provenance,
                 );
             }
 
@@ -1362,6 +1374,25 @@ impl VM {
 
             // CALL, CALLCODE
             0xF1 | 0xF2 => {
+                // Provenance-only: tag the inline return-data range with this call and remember it
+                // for a later RETURNDATACOPY. Operands top-first: gas, addr, value, argsOff, argsSize,
+                // retOff, retSize. No bytes are written, so execution / the CFG are unchanged.
+                #[cfg(feature = "experimental")]
+                {
+                    let frames = self.stack.peek_n(7);
+                    let ret_range = match (frames.get(5), frames.get(6)) {
+                        (Some(ro), Some(rs)) => {
+                            let off: usize = ro.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = rs.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = ret_range {
+                        Arc::make_mut(&mut self.memory).annotate_opcode(off, sz, operation.clone());
+                    }
+                    self.returndata_source = Some(operation.clone());
+                }
                 let address = self.stack.pop()?.value;
                 self.stack.pop_n(6);
 
@@ -1394,6 +1425,24 @@ impl VM {
 
             // DELEGATECALL, STATICCALL
             0xF4 | 0xFA => {
+                // Provenance-only (see CALL): operands top-first are gas, addr, argsOff, argsSize,
+                // retOff, retSize — so the return-data range is at indices 4, 5.
+                #[cfg(feature = "experimental")]
+                {
+                    let frames = self.stack.peek_n(6);
+                    let ret_range = match (frames.get(4), frames.get(5)) {
+                        (Some(ro), Some(rs)) => {
+                            let off: usize = ro.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = rs.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = ret_range {
+                        Arc::make_mut(&mut self.memory).annotate_opcode(off, sz, operation.clone());
+                    }
+                    self.returndata_source = Some(operation.clone());
+                }
                 let address = self.stack.pop()?.value;
                 self.stack.pop_n(5);
 

@@ -119,6 +119,16 @@ impl Memory {
         self.bytes.write(offset, size, opcode);
     }
 
+    /// Record byte-tracker provenance for `[offset, offset+size)` WITHOUT changing the stored bytes.
+    ///
+    /// Used to tag external-call return-data memory with the originating CALL's [`WrappedOpcode`] so a
+    /// later reader can attribute it — heimdall doesn't model the returned bytes themselves, so only
+    /// the provenance is recorded. Bytes are left untouched, so this never affects execution / the CFG.
+    #[cfg(feature = "experimental")]
+    pub fn annotate_opcode(&mut self, offset: usize, size: usize, opcode: WrappedOpcode) {
+        self.bytes.write(offset, size, opcode);
+    }
+
     /// Read the given number of bytes from the memory at the given offset.
     /// If the offset + size is greater than the current size of the memory, null bytes will be
     /// appended to the value.

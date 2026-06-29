@@ -221,6 +221,13 @@ pub trait TraceSink {
     fn intern_storage(&mut self, _id: U256, _entries: &[(U256, U256)], _transient: &[(U256, U256)]) {}
     /// A newly-seen events log.
     fn intern_events(&mut self, _id: U256, _logs: &[Log]) {}
+    /// The concrete result of an executed `SHA3` (`KECCAK256`), keyed by the interned id of the SHA3
+    /// `WrappedOpcode` itself (`op_id` == that step's sole `output_operation_id`). Emitted once, at the
+    /// step where the SHA3 executes. Because the id is the SHA3 expression's content hash, the SAME id
+    /// reappears nested in any later instruction whose stack operand carries that SHA3 (e.g. a mapping
+    /// `SLOAD(SHA3(..))` flowing across segments) — so a consumer can recover the keccak slot value by
+    /// id alone, without replaying the SHA3 (whose preimage memory may already be overwritten).
+    fn intern_keccak_eval(&mut self, _op_id: U256, _result: U256) {}
 
     /// One executed instruction's state.
     fn on_step(&mut self, _step: &StreamStep) {}
@@ -431,12 +438,22 @@ impl Interner {
             .iter()
             .map(|op| self.intern_opcode(sink, op))
             .collect();
-        let output_operation_ids = state
+        let output_operation_ids: Vec<U256> = state
             .last_instruction
             .output_operations
             .iter()
             .map(|op| self.intern_opcode(sink, op))
             .collect();
+        // SHA3 (KECCAK256, 0x20): record its concrete result keyed by the SHA3 expression's id (its
+        // sole output operation). Lets a later segment recover a mapping/array slot it carries on the
+        // stack without re-running the SHA3 — see `TraceSink::intern_keccak_eval`.
+        if state.last_instruction.opcode == 0x20 {
+            if let (Some(&op_id), Some(&result)) =
+                (output_operation_ids.first(), state.last_instruction.outputs.first())
+            {
+                sink.intern_keccak_eval(op_id, result);
+            }
+        }
         let stack_id = self.intern_stack(sink, &state.stack);
         let memory_id = self.intern_memory(sink, &state.memory);
         let storage_id = self.intern_storage(sink, &state.storage);
