@@ -116,6 +116,9 @@ pub enum InputRef {
     Raw(U256),
     /// Content-hash id of the nested interned opcode.
     Op(U256),
+    /// Memory-read value provenance: one `(start, end, op-id)` per covering write (`end` exclusive,
+    /// op-id is the content-hash of the producing write op). Mirrors `WrappedInput::MemorySlice`.
+    MemorySlice(Vec<(u64, u64, U256)>),
 }
 
 /// One executed instruction's state, with every heavy field replaced by an interned id.
@@ -265,6 +268,13 @@ impl Interner {
             match input {
                 WrappedInput::Raw(v) => refs.push(InputRef::Raw(*v)),
                 WrappedInput::Opcode(arc) => refs.push(InputRef::Op(self.intern_opcode_arc(sink, arc))),
+                WrappedInput::MemorySlice(segments) => {
+                    let segs = segments
+                        .iter()
+                        .map(|s| (s.start as u64, s.end as u64, self.intern_opcode_arc(sink, &s.op)))
+                        .collect();
+                    refs.push(InputRef::MemorySlice(segs));
+                }
             }
         }
         let id = hash_opcode(op.opcode.code, &refs);
@@ -492,6 +502,15 @@ fn hash_opcode(code: u8, refs: &[InputRef]) -> U256 {
             InputRef::Op(id) => {
                 data.push(1);
                 data.extend_from_slice(&u256_be(*id));
+            }
+            InputRef::MemorySlice(segs) => {
+                data.push(2);
+                data.extend_from_slice(&(segs.len() as u64).to_be_bytes());
+                for (s, e, id) in segs {
+                    data.extend_from_slice(&s.to_be_bytes());
+                    data.extend_from_slice(&e.to_be_bytes());
+                    data.extend_from_slice(&u256_be(*id));
+                }
             }
         }
     }
@@ -1001,6 +1020,15 @@ mod tests {
                 .map(|r| match r {
                     InputRef::Raw(v) => WrappedInput::Raw(*v),
                     InputRef::Op(child) => WrappedInput::Opcode(Arc::new(self.rebuild(*child))),
+                    InputRef::MemorySlice(segs) => WrappedInput::MemorySlice(
+                        segs.iter()
+                            .map(|(s, e, child)| crate::core::opcodes::MemorySegment {
+                                start: *s as usize,
+                                end: *e as usize,
+                                op: Arc::new(self.rebuild(*child)),
+                            })
+                            .collect(),
+                    ),
                 })
                 .collect();
             WrappedOpcode::new(*code, rebuilt_inputs)

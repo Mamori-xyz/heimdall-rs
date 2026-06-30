@@ -31,6 +31,12 @@ impl WrappedInput {
             WrappedInput::Opcode(opcode) => {
                 solidified_wrapped_input.push_str(&opcode.yulify());
             }
+            // Yul has no memory-provenance form; render the (first) producing write op.
+            WrappedInput::MemorySlice(segments) => {
+                if let Some(first) = segments.first() {
+                    solidified_wrapped_input.push_str(&first.op.yulify());
+                }
+            }
         }
 
         solidified_wrapped_input

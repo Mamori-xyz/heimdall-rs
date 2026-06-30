@@ -189,6 +189,25 @@ impl Opcode {
 pub enum WrappedInput {
     Raw(U256),
     Opcode(Arc<WrappedOpcode>),
+    /// Provenance of a memory read: the read bytes span one or more writes, each covering a sub-range.
+    /// Carried by the new MLOAD encoding so a value that was MSTORE'd then re-MLOAD'd keeps its lineage
+    /// (the old encoding dropped it, leaving a bare `memory[offset]` with no link to the stored value).
+    /// It is the LAST input of an MLOAD; the offset expression stays at `inputs[0]`, so legacy
+    /// `memory[offset]` rendering and any code reading `inputs[0]` are unchanged.
+    MemorySlice(Vec<MemorySegment>),
+}
+
+/// One contiguous run of memory bytes and the write op that produced it (a segment of a `MemorySlice`).
+/// `[start, end)` are absolute memory byte offsets; together the segments of an MLOAD's `MemorySlice`
+/// cover the 32 bytes it read, so one can tell exactly how many write ops the value spans.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MemorySegment {
+    /// Absolute memory byte offset where this segment starts (inclusive).
+    pub start: usize,
+    /// Absolute memory byte offset where this segment ends (exclusive).
+    pub end: usize,
+    /// The write op (e.g. an MSTORE's value expression) that produced the bytes in `[start, end)`.
+    pub op: Arc<WrappedOpcode>,
 }
 
 /// A WrappedOpcode is an Opcode with its inputs wrapped in a WrappedInput
@@ -283,6 +302,10 @@ impl WrappedInput {
         match self {
             WrappedInput::Raw(_) => 0,
             WrappedInput::Opcode(opcode) => opcode.depth(),
+            // Max depth across the writes that produced the read bytes.
+            WrappedInput::MemorySlice(segments) => {
+                segments.iter().map(|s| s.op.depth()).max().unwrap_or(0)
+            }
         }
     }
 
@@ -292,6 +315,8 @@ impl WrappedInput {
         match self {
             WrappedInput::Raw(_) => true,
             WrappedInput::Opcode(opcode) => opcode.is_constant(),
+            // A memory read depends on runtime state (what was written there), never constant.
+            WrappedInput::MemorySlice(_) => false,
         }
     }
 }
@@ -312,6 +337,15 @@ impl Display for WrappedInput {
         match self {
             WrappedInput::Raw(u256) => write!(f, "{u256}"),
             WrappedInput::Opcode(opcode) => write!(f, "{}", opcode.as_ref()),
+            WrappedInput::MemorySlice(segments) => write!(
+                f,
+                "mslice[{}]",
+                segments
+                    .iter()
+                    .map(|s| format!("{:#x}..{:#x}={}", s.start, s.end, s.op))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }

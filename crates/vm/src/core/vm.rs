@@ -109,6 +109,14 @@ fn contains_opcode_recursive(wrapped_op: &WrappedOpcode, target_opcode: u8) -> b
                     return true;
                 }
             }
+            // Recurse into memory-read provenance so a round-tripped opcode is still detected.
+            WrappedInput::MemorySlice(segments) => {
+                for seg in segments {
+                    if contains_opcode_recursive(&seg.op, target_opcode) {
+                        return true;
+                    }
+                }
+            }
             WrappedInput::Raw(_) => {
             }
         }
@@ -1081,13 +1089,28 @@ impl VM {
 
                 let result = U256::from(self.memory.read(i_usize, 32).as_slice());
 
-                let simplified_operation = if input_operations.iter()
+                // Index operand (inputs[0]): same legacy behaviour — collapse to Raw(i) when the offset
+                // expression itself involved an MLOAD (avoids unbounded nesting), else keep the offset
+                // expression. Keeping it at inputs[0] leaves `memory[offset]` rendering / inputs[0]
+                // readers unchanged.
+                #[allow(unused_mut)]
+                let mut simplified_operation = if input_operations.iter()
                 .any(|op| contains_opcode_recursive(op, 0x51)) {
-                    // replace the input operation with the actual offset value
                     WrappedOpcode::new(0x51, vec![WrappedInput::Raw(i)])
                 } else {
                     operation
                 };
+
+                // Append value provenance (inputs[1]): the write ops that produced the 32 bytes read at
+                // [i, i+32), so a value MSTORE'd then re-MLOAD'd keeps its lineage instead of decaying to
+                // a bare `memory[offset]`. Experimental-only (depends on the byte tracker).
+                #[cfg(feature = "experimental")]
+                {
+                    let segments = self.memory.bytes.segments_in_range(i_usize, 32);
+                    if !segments.is_empty() {
+                        simplified_operation.inputs.push(WrappedInput::MemorySlice(segments));
+                    }
+                }
 
                 // consume dynamic gas
                 let gas_cost = self.memory.expansion_cost(i_usize, 32);

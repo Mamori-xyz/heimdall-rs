@@ -1,6 +1,6 @@
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
-use crate::core::opcodes::WrappedOpcode;
+use crate::core::opcodes::{MemorySegment, WrappedOpcode};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RangeMap(pub HashMap<Range<usize>, WrappedOpcode>);
@@ -37,6 +37,32 @@ impl RangeMap {
         }
 
         memory_range
+    }
+
+    /// Like [`get_by_range`] but preserves each writing op's sub-range, returning the segments that
+    /// cover `[offset, offset+size)` sorted by start. A byte with no recorded write is simply absent
+    /// (untouched / zero memory). Drives the MLOAD value-provenance encoding
+    /// ([`WrappedInput::MemorySlice`](crate::core::opcodes::WrappedInput::MemorySlice)).
+    ///
+    /// Note: this map stores each range's `end` as the INCLUSIVE last byte (see [`write`]: `end =
+    /// offset + size - 1`); `MemorySegment::end` is exposed as the conventional EXCLUSIVE end.
+    pub fn segments_in_range(&self, offset: usize, size: usize) -> Vec<MemorySegment> {
+        let read_last = offset.saturating_add(size).saturating_sub(1); // inclusive last byte read
+        let mut segments: Vec<MemorySegment> = self
+            .0
+            .iter()
+            .filter_map(|(range, op)| {
+                let start = range.start.max(offset);
+                let last = range.end.min(read_last);
+                (start <= last).then(|| MemorySegment {
+                    start,
+                    end: last.saturating_add(1),
+                    op: Arc::new(op.clone()),
+                })
+            })
+            .collect();
+        segments.sort_by_key(|s| s.start);
+        segments
     }
 
     /// Associates the provided opcode with the range of memory modified by writing a `size`-byte

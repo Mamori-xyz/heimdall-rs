@@ -390,6 +390,24 @@ impl WrappedOpcode {
     pub fn new(opcode_int: u8, inputs: Vec<WrappedInput>) -> WrappedOpcode {
         WrappedOpcode { opcode: Opcode::new(opcode_int), inputs }
     }
+
+    /// Structured rendering. Identical to [`solidify`](Self::solidify), except an MLOAD that carries
+    /// value provenance (the new `inputs[1] = MemorySlice` encoding) renders as `memory[index = value]`
+    /// — the equals-inline form — so a value that round-tripped through memory shows where it came from.
+    /// The provenance value is itself rendered structurally (recurses, so nested round-trips also show
+    /// their source). Ops without provenance fall back to `solidify()`, keeping the legacy look.
+    pub fn solidify_structured(&self) -> String {
+        if self.opcode.name == "MLOAD" {
+            if let Some(WrappedInput::MemorySlice(_)) = self.inputs.get(1) {
+                return format!(
+                    "memory[{} = {}]",
+                    self.inputs[0]._solidify(),
+                    self.inputs[1]._solidify_structured()
+                );
+            }
+        }
+        self.solidify()
+    }
 }
 
 impl WrappedInput {
@@ -410,9 +428,57 @@ impl WrappedInput {
                     solidified_wrapped_input.push_str(solidified_opcode.as_str());
                 }
             }
+            // Value provenance of a memory read: a single covering write renders as its own expression;
+            // several writes render as `{start: expr, ...}` so one can see how many ops the value spans.
+            WrappedInput::MemorySlice(segments) => {
+                if segments.len() == 1 {
+                    solidified_wrapped_input.push_str(&segments[0].op.solidify());
+                } else {
+                    let parts: Vec<String> = segments
+                        .iter()
+                        .map(|s| {
+                            format!("{}: {}", encode_hex_reduced(U256::from(s.start)), s.op.solidify())
+                        })
+                        .collect();
+                    solidified_wrapped_input.push_str(&format!("{{{}}}", parts.join(", ")));
+                }
+            }
         }
 
         solidified_wrapped_input
+    }
+
+    /// Like [`_solidify`](Self::_solidify) but renders nested ops structurally (an MLOAD's value
+    /// provenance is shown via [`WrappedOpcode::solidify_structured`]). Used only on the structured path.
+    pub fn _solidify_structured(&self) -> String {
+        match self {
+            WrappedInput::Raw(u256) => encode_hex_reduced(*u256),
+            WrappedInput::Opcode(opcode) => {
+                let s = opcode.solidify_structured();
+                if s.contains(' ') {
+                    format!("({s})")
+                } else {
+                    s
+                }
+            }
+            WrappedInput::MemorySlice(segments) => {
+                if segments.len() == 1 {
+                    segments[0].op.solidify_structured()
+                } else {
+                    let parts: Vec<String> = segments
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{}: {}",
+                                encode_hex_reduced(U256::from(s.start)),
+                                s.op.solidify_structured()
+                            )
+                        })
+                        .collect();
+                    format!("{{{}}}", parts.join(", "))
+                }
+            }
+        }
     }
 }
 
