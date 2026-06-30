@@ -98,6 +98,9 @@ pub struct Instruction {
     pub output_operations: Vec<WrappedOpcode>,
 }
 
+// Generic util kept for reuse; no longer called now the MLOAD index keeps its full offset expression
+// (it used to gate collapsing the index to Raw(i) when the offset involved an MLOAD).
+#[allow(dead_code)]
 fn contains_opcode_recursive(wrapped_op: &WrappedOpcode, target_opcode: u8) -> bool {
     if wrapped_op.opcode.code == target_opcode {
         return true;
@@ -1089,17 +1092,13 @@ impl VM {
 
                 let result = U256::from(self.memory.read(i_usize, 32).as_slice());
 
-                // Index operand (inputs[0]): same legacy behaviour — collapse to Raw(i) when the offset
-                // expression itself involved an MLOAD (avoids unbounded nesting), else keep the offset
-                // expression. Keeping it at inputs[0] leaves `memory[offset]` rendering / inputs[0]
-                // readers unchanged.
+                // Index operand (inputs[0]) = the full offset expression, kept as-is (never collapsed to
+                // Raw(i)) so the index's own derivation stays traceable — including when the offset is
+                // itself loaded from memory (a nested MLOAD carrying its own provenance), mirroring how
+                // the value provenance is kept at inputs[1]. `memory[offset]` rendering / inputs[0]
+                // readers are unchanged.
                 #[allow(unused_mut)]
-                let mut simplified_operation = if input_operations.iter()
-                .any(|op| contains_opcode_recursive(op, 0x51)) {
-                    WrappedOpcode::new(0x51, vec![WrappedInput::Raw(i)])
-                } else {
-                    operation
-                };
+                let mut simplified_operation = operation;
 
                 // Append value provenance (inputs[1]): the write ops that produced the 32 bytes read at
                 // [i, i+32), so a value MSTORE'd then re-MLOAD'd keeps its lineage instead of decaying to

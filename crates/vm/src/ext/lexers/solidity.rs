@@ -401,7 +401,7 @@ impl WrappedOpcode {
             if let Some(WrappedInput::MemorySlice(_)) = self.inputs.get(1) {
                 return format!(
                     "memory[{} = {}]",
-                    self.inputs[0]._solidify(),
+                    self.inputs[0]._solidify_structured(),
                     self.inputs[1]._solidify_structured()
                 );
             }
