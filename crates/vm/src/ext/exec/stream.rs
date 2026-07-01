@@ -119,6 +119,8 @@ pub enum InputRef {
     /// Memory-read value provenance: one `(start, end, op-id)` per covering write (`end` exclusive,
     /// op-id is the content-hash of the producing write op). Mirrors `WrappedInput::MemorySlice`.
     MemorySlice(Vec<(u64, u64, U256)>),
+    /// Concrete `SHA3`/`KECCAK256` result carried in the op's identity. Mirrors `WrappedInput::KeccakResult`.
+    KeccakResult(U256),
 }
 
 /// One executed instruction's state, with every heavy field replaced by an interned id.
@@ -275,6 +277,7 @@ impl Interner {
                         .collect();
                     refs.push(InputRef::MemorySlice(segs));
                 }
+                WrappedInput::KeccakResult(v) => refs.push(InputRef::KeccakResult(*v)),
             }
         }
         let id = hash_opcode(op.opcode.code, &refs);
@@ -511,6 +514,10 @@ fn hash_opcode(code: u8, refs: &[InputRef]) -> U256 {
                     data.extend_from_slice(&e.to_be_bytes());
                     data.extend_from_slice(&u256_be(*id));
                 }
+            }
+            InputRef::KeccakResult(v) => {
+                data.push(3);
+                data.extend_from_slice(&u256_be(*v));
             }
         }
     }
@@ -1029,6 +1036,7 @@ mod tests {
                             })
                             .collect(),
                     ),
+                    InputRef::KeccakResult(v) => WrappedInput::KeccakResult(*v),
                 })
                 .collect();
             WrappedOpcode::new(*code, rebuilt_inputs)

@@ -195,6 +195,13 @@ pub enum WrappedInput {
     /// It is the LAST input of an MLOAD; the offset expression stays at `inputs[0]`, so legacy
     /// `memory[offset]` rendering and any code reading `inputs[0]` are unchanged.
     MemorySlice(Vec<MemorySegment>),
+    /// The concrete result of a `SHA3`/`KECCAK256`, attached to that op so its content-hash identity
+    /// becomes distinct per concrete result. Two mapping accesses whose symbolic key expression is
+    /// identical but whose runtime key differs (e.g. `m[0]` vs `m[2]`) otherwise dedup to one node id,
+    /// collapsing the recorded keccak slot to whichever executed first; carrying the result here splits
+    /// them so each keeps its own slot. Experimental-only; appended as the LAST input of a SHA3, so
+    /// preimage-reading code and rendering are unchanged.
+    KeccakResult(U256),
 }
 
 /// One contiguous run of memory bytes and the write op that produced it (a segment of a `MemorySlice`).
@@ -306,6 +313,8 @@ impl WrappedInput {
             WrappedInput::MemorySlice(segments) => {
                 segments.iter().map(|s| s.op.depth()).max().unwrap_or(0)
             }
+            // A concrete keccak result is a leaf value.
+            WrappedInput::KeccakResult(_) => 0,
         }
     }
 
@@ -317,6 +326,9 @@ impl WrappedInput {
             WrappedInput::Opcode(opcode) => opcode.is_constant(),
             // A memory read depends on runtime state (what was written there), never constant.
             WrappedInput::MemorySlice(_) => false,
+            // A concrete keccak result is a fixed value (SHA3 itself is never in the pure allow-list,
+            // so this does not make a SHA3 expression fold to a constant).
+            WrappedInput::KeccakResult(_) => true,
         }
     }
 }
@@ -346,6 +358,7 @@ impl Display for WrappedInput {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            WrappedInput::KeccakResult(v) => write!(f, "kresult[{v:#x}]"),
         }
     }
 }

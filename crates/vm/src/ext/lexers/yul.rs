@@ -37,6 +37,8 @@ impl WrappedInput {
                     solidified_wrapped_input.push_str(&first.op.yulify());
                 }
             }
+            // A keccak result is an internal annotation, not a source-level operand: render nothing.
+            WrappedInput::KeccakResult(_) => {}
         }
 
         solidified_wrapped_input

@@ -122,6 +122,8 @@ fn contains_opcode_recursive(wrapped_op: &WrappedOpcode, target_opcode: u8) -> b
             }
             WrappedInput::Raw(_) => {
             }
+            WrappedInput::KeccakResult(_) => {
+            }
         }
     }
     false
@@ -787,12 +789,24 @@ impl VM {
                 let data = self.memory.read(offset, size);
                 let result = keccak256(data);
 
+                // Attach the concrete result so this SHA3's content-hash identity is distinct per
+                // result: two mapping accesses whose symbolic key expression is identical but whose
+                // runtime key differs (e.g. `m[0]` vs `m[2]`) otherwise share one node id, collapsing
+                // the recorded slot to whichever ran first. Appended LAST, so preimage-reading code and
+                // rendering are unchanged. Experimental-only.
+                #[allow(unused_mut)]
+                let mut simplified_operation = operation;
+                #[cfg(feature = "experimental")]
+                {
+                    simplified_operation.inputs.push(WrappedInput::KeccakResult(U256::from(result)));
+                }
+
                 // consume dynamic gas
                 let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
                 let gas_cost = 6_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.stack.push(U256::from(result), operation);
+                self.stack.push(U256::from(result), simplified_operation);
             }
 
             // ADDRESS
