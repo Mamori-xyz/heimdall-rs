@@ -142,6 +142,15 @@ pub struct StreamStep {
     pub input_operation_ids: Vec<U256>,
     /// Interned ids of the symbolic output expressions (`output_operations`).
     pub output_operation_ids: Vec<U256>,
+    /// Provenance: the unique `step` id of each corresponding input/output operation (parallel to the
+    /// `*_operation_ids`; `0` = no step). Unlike the content-hashed ids — which dedup structurally-equal
+    /// ops across the whole trace — `step` is unique per executed instruction, so a consumer can walk
+    /// dataflow BY STEP (`step → the StreamStep that output it`) to the exact producing (segment, pc),
+    /// with no content-address collision. `#[serde(default)]` keeps older dumps (no steps) loadable.
+    #[serde(default)]
+    pub input_operation_steps: Vec<u64>,
+    #[serde(default)]
+    pub output_operation_steps: Vec<u64>,
     pub stack_id: U256,
     pub memory_id: U256,
     pub storage_id: U256,
@@ -457,6 +466,11 @@ impl Interner {
             .iter()
             .map(|op| self.intern_opcode(sink, op))
             .collect();
+        // Parallel provenance: the unique step id of each operand (0 = none). Collision-free, unlike ids.
+        let input_operation_steps: Vec<u64> =
+            state.last_instruction.input_operations.iter().map(|op| op.step.unwrap_or(0)).collect();
+        let output_operation_steps: Vec<u64> =
+            state.last_instruction.output_operations.iter().map(|op| op.step.unwrap_or(0)).collect();
         // SHA3 (KECCAK256, 0x20): record its concrete result keyed by the SHA3 expression's id (its
         // sole output operation). Lets a later segment recover a mapping/array slot it carries on the
         // stack without re-running the SHA3 — see `TraceSink::intern_keccak_eval`.
@@ -483,6 +497,8 @@ impl Interner {
             outputs: state.last_instruction.outputs.clone(),
             input_operation_ids,
             output_operation_ids,
+            input_operation_steps,
+            output_operation_steps,
             stack_id,
             memory_id,
             storage_id,
