@@ -798,6 +798,15 @@ impl VM {
                 let mut simplified_operation = operation;
                 #[cfg(feature = "experimental")]
                 {
+                    // Attach the write-provenance of the hashed bytes `[offset, offset+size)` so the
+                    // preimage keys (e.g. a mapping key MSTORE'd into scratch) are recoverable
+                    // structurally — the SHA3's own inputs are only `[offset, size]`, never the content.
+                    // Mirrors the MLOAD MemorySlice encoding; lets a downstream `SLOAD(SHA3(..))` resolve
+                    // its keccak slot's index variables without the memory overlay.
+                    let segments = self.memory.bytes.segments_in_range(offset, size);
+                    if !segments.is_empty() {
+                        simplified_operation.inputs.push(WrappedInput::MemorySlice(segments));
+                    }
                     simplified_operation.inputs.push(WrappedInput::KeccakResult(U256::from(result)));
                 }
 
@@ -1022,6 +1031,16 @@ impl VM {
 
             // RETURNDATASIZE
             0x3D => {
+                // Attach the source CALL (the one whose return data this sizes) as an input, so a
+                // downstream reader can trace the size back to its external call structurally. `solidify`
+                // renders RETURNDATASIZE by opcode name ("ret0.length") and ignores inputs, so the
+                // string path (OLD) is unchanged. Experimental-only.
+                #[allow(unused_mut)]
+                let mut operation = operation;
+                #[cfg(feature = "experimental")]
+                if let Some(call) = self.returndata_source.clone() {
+                    operation.inputs.push(WrappedInput::Opcode(Arc::new(call)));
+                }
                 self.stack.push(U256::from(1u8), operation);
             }
 
@@ -1413,9 +1432,28 @@ impl VM {
                 // Provenance-only: tag the inline return-data range with this call and remember it
                 // for a later RETURNDATACOPY. Operands top-first: gas, addr, value, argsOff, argsSize,
                 // retOff, retSize. No bytes are written, so execution / the CFG are unchanged.
+                #[allow(unused_mut)]
+                let mut operation = operation;
                 #[cfg(feature = "experimental")]
                 {
                     let frames = self.stack.peek_n(7);
+                    // Attach the argument region's write-provenance FIRST so the enriched call op (with
+                    // its args) is what tags the return data and becomes `returndata_source` — a reader
+                    // of the call's success/return-data can then trace the arguments it was given.
+                    let args_range = match (frames.get(3), frames.get(4)) {
+                        (Some(ao), Some(asz)) => {
+                            let off: usize = ao.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = asz.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = args_range {
+                        let segments = self.memory.bytes.segments_in_range(off, sz);
+                        if !segments.is_empty() {
+                            operation.inputs.push(WrappedInput::MemorySlice(segments));
+                        }
+                    }
                     let ret_range = match (frames.get(5), frames.get(6)) {
                         (Some(ro), Some(rs)) => {
                             let off: usize = ro.value.try_into().unwrap_or(usize::MAX);
@@ -1462,10 +1500,27 @@ impl VM {
             // DELEGATECALL, STATICCALL
             0xF4 | 0xFA => {
                 // Provenance-only (see CALL): operands top-first are gas, addr, argsOff, argsSize,
-                // retOff, retSize — so the return-data range is at indices 4, 5.
+                // retOff, retSize — so the args range is at indices 2,3 and the return range at 4,5.
+                #[allow(unused_mut)]
+                let mut operation = operation;
                 #[cfg(feature = "experimental")]
                 {
                     let frames = self.stack.peek_n(6);
+                    // Argument region write-provenance FIRST (see CALL above).
+                    let args_range = match (frames.get(2), frames.get(3)) {
+                        (Some(ao), Some(asz)) => {
+                            let off: usize = ao.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = asz.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = args_range {
+                        let segments = self.memory.bytes.segments_in_range(off, sz);
+                        if !segments.is_empty() {
+                            operation.inputs.push(WrappedInput::MemorySlice(segments));
+                        }
+                    }
                     let ret_range = match (frames.get(4), frames.get(5)) {
                         (Some(ro), Some(rs)) => {
                             let off: usize = ro.value.try_into().unwrap_or(usize::MAX);
