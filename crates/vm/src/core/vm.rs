@@ -311,6 +311,15 @@ impl VM {
             .map(|x| WrappedInput::Opcode(Arc::new(x.to_owned())))
             .collect::<Vec<WrappedInput>>();
         let mut operation = WrappedOpcode::new(opcode, wrapped_inputs);
+        // Stamp a globally-unique execution step id (provenance; excluded from Eq/Hash). Unique per
+        // executed instruction across the whole CFG exploration — including loop iterations and forked
+        // branches — so any consumer can map a WrappedOpcode node back to the exact (segment, pc) that
+        // produced it, free of the content-address collisions that structural matching suffers.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_STEP: AtomicU64 = AtomicU64::new(1);
+            operation.step = Some(NEXT_STEP.fetch_add(1, Ordering::Relaxed));
+        }
 
         // if step-tracing feature is enabled, print the current operation
         #[cfg(feature = "step-tracing")]

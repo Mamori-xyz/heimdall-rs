@@ -218,10 +218,20 @@ pub struct MemorySegment {
 }
 
 /// A WrappedOpcode is an Opcode with its inputs wrapped in a WrappedInput
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct WrappedOpcode {
     pub opcode: Opcode,
     pub inputs: Vec<WrappedInput>,
+    /// Provenance: a globally-unique id of the execution step that produced this node (set by the VM
+    /// when it builds the operation; see `VM::step`). Distinct per executed instruction INCLUDING loop
+    /// iterations, so a consumer can map any tree node back to the exact (segment, pc) that produced it
+    /// without the content-address collisions that plague structural matching. `None` for nodes not
+    /// produced by execution (synthesized during simplification, rebuilt from a dump, defaults).
+    ///
+    /// IMPORTANT: `step` is provenance metadata, NOT identity — it is deliberately excluded from
+    /// `PartialEq`/`Eq`/`Hash` (hand-written below) so structural equality, dedup, and interning are
+    /// unchanged. Two structurally-equal nodes remain equal even if produced at different steps.
+    pub step: Option<u64>,
 }
 
 impl Default for WrappedOpcode {
@@ -229,7 +239,23 @@ impl Default for WrappedOpcode {
         WrappedOpcode {
             opcode: Opcode { code: 0, name: "unknown", mingas: 0, inputs: 0, outputs: 0 },
             inputs: Vec::new(),
+            step: None,
         }
+    }
+}
+
+// `step` is provenance-only and MUST NOT participate in equality/hashing (see field docs): identity is
+// purely structural (`opcode` + `inputs`), preserving all dedup/interning semantics.
+impl PartialEq for WrappedOpcode {
+    fn eq(&self, other: &Self) -> bool {
+        self.opcode == other.opcode && self.inputs == other.inputs
+    }
+}
+impl Eq for WrappedOpcode {}
+impl std::hash::Hash for WrappedOpcode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.opcode.hash(state);
+        self.inputs.hash(state);
     }
 }
 
