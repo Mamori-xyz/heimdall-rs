@@ -8,6 +8,25 @@ use heimdall_common::{
 
 use crate::core::opcodes::{Opcode, WrappedInput, WrappedOpcode};
 
+use std::cell::Cell;
+
+/// Max total nodes emitted by one `solidify_capped` call. A depth cap alone doesn't bound the output for
+/// a WIDE/shared DAG (millions of nodes within a few levels — a `memory[0x40]` chain solidified to 10MB);
+/// this bounds the produced string. Once hit, remaining nodes render as `…`.
+const SOLIDIFY_MAX_NODES: u32 = 4_000;
+
+thread_local! {
+    /// Current `solidify` recursion depth on this thread (incremented per `WrappedOpcode` level).
+    static SOLIDIFY_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Max `solidify` nesting depth on this thread; nodes deeper than this render as `…`. Default
+    /// `usize::MAX` (uncapped) — set for the duration of one call via [`WrappedOpcode::solidify_capped`].
+    static SOLIDIFY_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// Nodes emitted so far by the current `solidify_capped` call.
+    static SOLIDIFY_NODES: Cell<u32> = const { Cell::new(0) };
+    /// Node budget for the current call (default `u32::MAX` = unbounded).
+    static SOLIDIFY_NODE_CAP: Cell<u32> = const { Cell::new(u32::MAX) };
+}
+
 pub fn is_ext_call_precompile(precompile_address: U256) -> bool {
     let address: usize = match precompile_address.try_into() {
         Ok(x) => x,
@@ -18,8 +37,79 @@ pub fn is_ext_call_precompile(precompile_address: U256) -> bool {
 }
 
 impl WrappedOpcode {
-    /// Returns a WrappedOpcode's solidity representation.
+    /// Returns a WrappedOpcode's solidity representation. Uncapped unless a depth cap is active on this
+    /// thread (see [`Self::solidify_capped`]); when the cap is hit, deeper nodes render as `…`.
     pub fn solidify(&self) -> String {
+        let cur = SOLIDIFY_DEPTH.with(|c| c.get());
+        // At the top of each independent (depth-0) solidify, reset the node budget so every operand
+        // string gets its own budget (not a shared one across a whole segment's ops). This makes even the
+        // UNCAPPED `solidify()` calls bounded whenever a scope bound is active (see `SolidifyBounds`).
+        if cur == 0 {
+            SOLIDIFY_NODES.with(|c| c.set(0));
+        }
+        if cur >= SOLIDIFY_CAP.with(|c| c.get()) {
+            return "…".to_string();
+        }
+        // Node budget: bounds output for wide/shared DAGs that a depth cap alone can't.
+        let n = SOLIDIFY_NODES.with(|c| c.get());
+        if n >= SOLIDIFY_NODE_CAP.with(|c| c.get()) {
+            return "…".to_string();
+        }
+        SOLIDIFY_NODES.with(|c| c.set(n.saturating_add(1)));
+        SOLIDIFY_DEPTH.with(|c| c.set(cur + 1));
+        let out = self.solidify_impl();
+        SOLIDIFY_DEPTH.with(|c| c.set(cur));
+        out
+    }
+
+    /// Solidify but stop at `max_depth` levels of nesting AND `SOLIDIFY_MAX_NODES` total nodes — beyond
+    /// either, nodes render as `…`. Bounds both the cost and the OUTPUT SIZE for deep/wide expression
+    /// DAGs, whose full solidify can blow up (shared subtrees re-expanded on every path). Only affects
+    /// this call (caps/counters restored afterward).
+    pub fn solidify_capped(&self, max_depth: usize) -> String {
+        let prev_cap = SOLIDIFY_CAP.with(|c| c.replace(max_depth));
+        let prev_depth = SOLIDIFY_DEPTH.with(|c| c.replace(0));
+        let prev_nodes = SOLIDIFY_NODES.with(|c| c.replace(0));
+        let prev_node_cap = SOLIDIFY_NODE_CAP.with(|c| c.replace(SOLIDIFY_MAX_NODES));
+        let out = self.solidify();
+        SOLIDIFY_CAP.with(|c| c.set(prev_cap));
+        SOLIDIFY_DEPTH.with(|c| c.set(prev_depth));
+        SOLIDIFY_NODES.with(|c| c.set(prev_nodes));
+        SOLIDIFY_NODE_CAP.with(|c| c.set(prev_node_cap));
+        out
+    }
+
+    /// Default node budget bound applied per depth-0 solidify while a [`SolidifyBounds`] scope is active.
+    pub const DEFAULT_SOLIDIFY_MAX_NODES: u32 = SOLIDIFY_MAX_NODES;
+}
+
+/// RAII scope that bounds EVERY `solidify()` on this thread (including uncapped calls) to `max_depth`
+/// nesting and `max_nodes` per operand string, until dropped. Wrap a block that solidifies many operands
+/// (e.g. `convert` building `raw_input`/`raw_output`) so a single pathological deep/wide expression DAG
+/// can't produce a multi-MB string. Restores the previous bounds on drop (panic-safe).
+pub struct SolidifyBounds {
+    prev_cap: usize,
+    prev_node_cap: u32,
+}
+
+impl SolidifyBounds {
+    pub fn new(max_depth: usize, max_nodes: u32) -> Self {
+        let prev_cap = SOLIDIFY_CAP.with(|c| c.replace(max_depth));
+        let prev_node_cap = SOLIDIFY_NODE_CAP.with(|c| c.replace(max_nodes));
+        Self { prev_cap, prev_node_cap }
+    }
+}
+
+impl Drop for SolidifyBounds {
+    fn drop(&mut self) {
+        SOLIDIFY_CAP.with(|c| c.set(self.prev_cap));
+        SOLIDIFY_NODE_CAP.with(|c| c.set(self.prev_node_cap));
+    }
+}
+
+impl WrappedOpcode {
+
+    fn solidify_impl(&self) -> String {
         let mut solidified_wrapped_opcode = String::new();
 
         match self.opcode.name {

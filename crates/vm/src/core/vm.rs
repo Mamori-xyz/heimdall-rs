@@ -96,6 +96,10 @@ pub struct Instruction {
     pub outputs: Vec<U256>,
     pub input_operations: Vec<WrappedOpcode>,
     pub output_operations: Vec<WrappedOpcode>,
+    /// This instruction's own globally-unique execution step id (same value stamped on `operation`
+    /// at execution time). Reliable even for value-less terminators (JUMP/JUMPI/STOP…) whose
+    /// `output_operations` is empty, so downstream provenance can key on it directly.
+    pub step: Option<u64>,
 }
 
 // Generic util kept for reuse; no longer called now the MLOAD index keeps its full offset expression
@@ -275,6 +279,7 @@ impl VM {
                 outputs: Vec::new(),
                 input_operations: Vec::new(),
                 output_operations: Vec::new(),
+                step: None, // sentinel: bytecode-exhausted, no opcode executed (pre-stamp)
             });
         }
 
@@ -315,11 +320,13 @@ impl VM {
         // executed instruction across the whole CFG exploration — including loop iterations and forked
         // branches — so any consumer can map a WrappedOpcode node back to the exact (segment, pc) that
         // produced it, free of the content-address collisions that structural matching suffers.
-        {
+        let this_step = {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT_STEP: AtomicU64 = AtomicU64::new(1);
-            operation.step = Some(NEXT_STEP.fetch_add(1, Ordering::Relaxed));
-        }
+            let s = NEXT_STEP.fetch_add(1, Ordering::Relaxed);
+            operation.step = Some(s);
+            s
+        };
 
         // if step-tracing feature is enabled, print the current operation
         #[cfg(feature = "step-tracing")]
@@ -346,6 +353,7 @@ impl VM {
                     outputs: Vec::new(),
                     input_operations,
                     output_operations: Vec::new(),
+                    step: Some(this_step),
                 });
             }
 
@@ -1250,6 +1258,7 @@ impl VM {
                         outputs: Vec::new(),
                         input_operations,
                         output_operations: Vec::new(),
+                        step: Some(this_step),
                     });
                 } else {
                     self.instruction = pc + 1;
@@ -1283,6 +1292,7 @@ impl VM {
                             outputs: Vec::new(),
                             input_operations,
                             output_operations: Vec::new(),
+                            step: Some(this_step),
                         });
                     } else {
                         self.instruction = pc + 1;
@@ -1620,6 +1630,7 @@ impl VM {
             outputs,
             input_operations,
             output_operations,
+            step: Some(this_step),
         })
     }
 

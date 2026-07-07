@@ -116,9 +116,12 @@ pub enum InputRef {
     Raw(U256),
     /// Content-hash id of the nested interned opcode.
     Op(U256),
-    /// Memory-read value provenance: one `(start, end, op-id)` per covering write (`end` exclusive,
-    /// op-id is the content-hash of the producing write op). Mirrors `WrappedInput::MemorySlice`.
-    MemorySlice(Vec<(u64, u64, U256)>),
+    /// Memory-read value provenance: one `(start, end, op-id, op-step)` per covering write (`end`
+    /// exclusive, op-id is the content-hash of the producing write op, op-step is that write's unique
+    /// execution step id — `0` = none). The step lets MSTORE→MLOAD memory dataflow resolve to the
+    /// exact producing (segment, pc), which the content-hash op-id cannot (it dedups). Mirrors
+    /// `WrappedInput::MemorySlice`.
+    MemorySlice(Vec<(u64, u64, U256, u64)>),
     /// Concrete `SHA3`/`KECCAK256` result carried in the op's identity. Mirrors `WrappedInput::KeccakResult`.
     KeccakResult(U256),
 }
@@ -151,6 +154,12 @@ pub struct StreamStep {
     pub input_operation_steps: Vec<u64>,
     #[serde(default)]
     pub output_operation_steps: Vec<u64>,
+    /// This instruction's OWN unique step id (== `Instruction.step`). Reliable even for value-less
+    /// terminators whose `output_operation_steps` is empty, so a complete step→(segment,pc) index can
+    /// be keyed on it directly — including for steps whose full record is later dropped by on-disk
+    /// segment-id dedup across a merged/extended dump. `0` = none (older dumps).
+    #[serde(default)]
+    pub step_id: u64,
     pub stack_id: U256,
     pub memory_id: U256,
     pub storage_id: U256,
@@ -247,6 +256,23 @@ pub trait TraceSink {
     fn on_step(&mut self, _step: &StreamStep) {}
     /// A finished segment.
     fn on_segment(&mut self, _segment: &StreamSegment) {}
+    /// Provenance for a ROUTE-PREFIX instruction replayed to set up VM state during an extend but NOT
+    /// streamed as a full step/segment (see [`VM::build_trace_start_from_route_chained`]). Such an
+    /// instruction gets a fresh unique `step` id and its value can be carried on the stack into the
+    /// (streamed) downstream segments, which then reference that step — so without recording where it
+    /// ran, the step graph has holes. `segment_hash` is the replay's chained id for the segment the
+    /// instruction belongs to (identical to the CFG node's id, so it's navigable); `pc` is the 1-indexed
+    /// instruction pointer; `input_steps` are its operands' producing steps (to continue the walk).
+    /// Only emitted for value-relevant, non-DUP/SWAP instructions.
+    fn on_route_step(
+        &mut self,
+        _step: u64,
+        _segment_hash: U256,
+        _pc: u128,
+        _opcode: u8,
+        _input_steps: &[u64],
+    ) {
+    }
 }
 
 /// Content-hash interner. Produces order-independent `U256` ids and emits each value through the
@@ -282,7 +308,12 @@ impl Interner {
                 WrappedInput::MemorySlice(segments) => {
                     let segs = segments
                         .iter()
-                        .map(|s| (s.start as u64, s.end as u64, self.intern_opcode_arc(sink, &s.op)))
+                        .map(|s| {
+                            // Carry the write op's execution step (0 = none) so MSTORE→MLOAD memory
+                            // dataflow resolves to the exact producing (segment, pc) later.
+                            let step = s.op.step.unwrap_or(0);
+                            (s.start as u64, s.end as u64, self.intern_opcode_arc(sink, &s.op), step)
+                        })
                         .collect();
                     refs.push(InputRef::MemorySlice(segs));
                 }
@@ -499,6 +530,7 @@ impl Interner {
             output_operation_ids,
             input_operation_steps,
             output_operation_steps,
+            step_id: state.last_instruction.step.unwrap_or(0),
             stack_id,
             memory_id,
             storage_id,
@@ -525,7 +557,10 @@ fn hash_opcode(code: u8, refs: &[InputRef]) -> U256 {
             InputRef::MemorySlice(segs) => {
                 data.push(2);
                 data.extend_from_slice(&(segs.len() as u64).to_be_bytes());
-                for (s, e, id) in segs {
+                // `op-step` (4th elem) is per-execution provenance, deliberately EXCLUDED from the
+                // content hash so the same memory-write op keeps a stable id across executions
+                // (mirrors `WrappedOpcode.step` being excluded from `Eq`/`Hash`).
+                for (s, e, id, _step) in segs {
                     data.extend_from_slice(&s.to_be_bytes());
                     data.extend_from_slice(&e.to_be_bytes());
                     data.extend_from_slice(&u256_be(*id));
@@ -720,7 +755,7 @@ impl VM {
         // Build the root segment + its successor VMs, and determine the root's chained id.
         let (root_trace, root_next_vms, route_hashes, root_id) = if let Some(route) = route {
             let (t, v, rh, root_id) =
-                self.build_trace_start_from_route_chained(route, &jumpdest_pc)?;
+                self.build_trace_start_from_route_chained(route, &jumpdest_pc, sink)?;
             (t, v, rh, root_id)
         } else {
             let (t, v) = self.build_trace()?;
@@ -831,10 +866,11 @@ impl VM {
     /// untouched). In addition to replaying the route and returning the route-segment loop hashes,
     /// it folds the chained id along the route so the route-end node gets the same id a fresh full
     /// walk would assign. Returns `(root_trace, next_vms, route_segment_hashes, route_end_id)`.
-    fn build_trace_start_from_route_chained(
+    fn build_trace_start_from_route_chained<S: TraceSink>(
         &mut self,
         mut route: Vec<(usize, usize)>,
         jumpdest_pc: &HashSet<U256>,
+        sink: &mut S,
     ) -> Result<(VMTrace, Vec<VM>, HashMap<U256, u32>, U256)> {
         let mut root_trace = VMTrace {
             instruction: self.instruction,
@@ -857,6 +893,26 @@ impl VM {
         while self.bytecode.len() >= self.instruction as usize {
             let state = self.step()?;
             let last_instruction = state.last_instruction.clone();
+
+            // Route-prefix provenance: this replayed instruction gets a fresh step id and its value can
+            // be carried on the stack into the streamed downstream segments, which then reference it.
+            // Record where it ran (`chained` == this segment's CFG id) so those references resolve.
+            // Skip DUP/SWAP — they forward an existing step rather than create one. The route-end
+            // instruction is also emitted here, harmlessly: it is additionally streamed via `on_step`,
+            // whose record wins at index time.
+            if let Some(st) = last_instruction.step {
+                if st != 0 && !(0x80..=0x9f).contains(&last_instruction.opcode) {
+                    let input_steps: Vec<u64> =
+                        last_instruction.input_operations.iter().map(|o| o.step.unwrap_or(0)).collect();
+                    sink.on_route_step(
+                        st,
+                        chained,
+                        last_instruction.instruction,
+                        last_instruction.opcode,
+                        &input_steps,
+                    );
+                }
+            }
 
             if last_instruction.opcode == 0x57 {
                 // jumpi
