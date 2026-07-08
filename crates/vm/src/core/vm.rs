@@ -102,6 +102,16 @@ pub struct Instruction {
     pub step: Option<u64>,
 }
 
+/// A constant-folded stack value: the executing instruction (e.g. `ADD` of two constants) is replaced
+/// by a synthetic `PUSH32(result)`. Stamp it with the folding instruction's step so the constant keeps
+/// (segment, pc) provenance — an unstamped synthetic op severs the step graph (its consumers record
+/// operand step 0, so no lineage/source can ever be resolved for it).
+fn folded_const(result: U256, step: u64) -> WrappedOpcode {
+    let mut op = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)]);
+    op.step = Some(step);
+    op
+}
+
 // Generic util kept for reuse; no longer called now the MLOAD index keeps its full offset expression
 // (it used to gate collapsing the index to Raw(i) when the offset involved an MLOAD).
 #[allow(dead_code)]
@@ -369,7 +379,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -387,7 +397,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -405,7 +415,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -426,7 +436,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&numerator.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&denominator.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -448,7 +458,7 @@ impl VM {
                     (0x5f..=0x7f).contains(&denominator.operation.opcode.code)
                 {
                     simplified_operation =
-                        WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result.into_raw())])
+                        folded_const(result.into_raw(), this_step)
                 }
 
                 self.stack.push(result.into_raw(), simplified_operation);
@@ -469,7 +479,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&modulus.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -491,7 +501,7 @@ impl VM {
                     (0x5f..=0x7f).contains(&modulus.operation.opcode.code)
                 {
                     simplified_operation =
-                        WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result.into_raw())])
+                        folded_const(result.into_raw(), this_step)
                 }
 
                 self.stack.push(result.into_raw(), simplified_operation);
@@ -513,7 +523,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -535,7 +545,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -553,7 +563,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&exponent.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 // consume dynamic gas
@@ -657,7 +667,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -675,7 +685,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -693,7 +703,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -708,7 +718,7 @@ impl VM {
                 // if both inputs are PUSH instructions, simplify the operation
                 let mut simplified_operation = operation;
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -743,7 +753,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -763,7 +773,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -788,7 +798,7 @@ impl VM {
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
                     simplified_operation =
-                        WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result.into_raw())])
+                        folded_const(result.into_raw(), this_step)
                 }
 
                 self.stack.push(result.into_raw(), simplified_operation);
