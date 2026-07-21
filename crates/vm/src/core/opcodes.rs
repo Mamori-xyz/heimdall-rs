@@ -1,5 +1,6 @@
 use ethers::types::U256;
 use std::fmt::{Display, Formatter, Result};
+use std::sync::Arc;
 
 /// An [`Opcode`] represents an Ethereum Virtual Machine (EVM) opcode. \
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -177,18 +178,60 @@ impl Opcode {
     }
 }
 
-/// A WrappedInput can contain either a raw U256 value or a WrappedOpcode
+/// A WrappedInput can contain either a raw U256 value or a WrappedOpcode.
+///
+/// The nested opcode is held behind an `Arc` so that combining expressions (e.g. building
+/// `ADD(a, b)` from two stack operands) shares the operand subtrees by reference-count bump instead
+/// of deep-copying them. This makes `WrappedOpcode::clone()` shallow (top node + Arc-bumped
+/// children) and turns a strictly-deepening accumulator like `ADD(ADD(ADD(…)))` from O(N²)
+/// time/memory (every step deep-copies the growing tree) into O(N) with shared subtrees.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WrappedInput {
     Raw(U256),
-    Opcode(WrappedOpcode),
+    Opcode(Arc<WrappedOpcode>),
+    /// Provenance of a memory read: the read bytes span one or more writes, each covering a sub-range.
+    /// Carried by the new MLOAD encoding so a value that was MSTORE'd then re-MLOAD'd keeps its lineage
+    /// (the old encoding dropped it, leaving a bare `memory[offset]` with no link to the stored value).
+    /// It is the LAST input of an MLOAD; the offset expression stays at `inputs[0]`, so legacy
+    /// `memory[offset]` rendering and any code reading `inputs[0]` are unchanged.
+    MemorySlice(Vec<MemorySegment>),
+    /// The concrete result of a `SHA3`/`KECCAK256`, attached to that op so its content-hash identity
+    /// becomes distinct per concrete result. Two mapping accesses whose symbolic key expression is
+    /// identical but whose runtime key differs (e.g. `m[0]` vs `m[2]`) otherwise dedup to one node id,
+    /// collapsing the recorded keccak slot to whichever executed first; carrying the result here splits
+    /// them so each keeps its own slot. Experimental-only; appended as the LAST input of a SHA3, so
+    /// preimage-reading code and rendering are unchanged.
+    KeccakResult(U256),
+}
+
+/// One contiguous run of memory bytes and the write op that produced it (a segment of a `MemorySlice`).
+/// `[start, end)` are absolute memory byte offsets; together the segments of an MLOAD's `MemorySlice`
+/// cover the 32 bytes it read, so one can tell exactly how many write ops the value spans.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MemorySegment {
+    /// Absolute memory byte offset where this segment starts (inclusive).
+    pub start: usize,
+    /// Absolute memory byte offset where this segment ends (exclusive).
+    pub end: usize,
+    /// The write op (e.g. an MSTORE's value expression) that produced the bytes in `[start, end)`.
+    pub op: Arc<WrappedOpcode>,
 }
 
 /// A WrappedOpcode is an Opcode with its inputs wrapped in a WrappedInput
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct WrappedOpcode {
     pub opcode: Opcode,
     pub inputs: Vec<WrappedInput>,
+    /// Provenance: a globally-unique id of the execution step that produced this node (set by the VM
+    /// when it builds the operation; see `VM::step`). Distinct per executed instruction INCLUDING loop
+    /// iterations, so a consumer can map any tree node back to the exact (segment, pc) that produced it
+    /// without the content-address collisions that plague structural matching. `None` for nodes not
+    /// produced by execution (synthesized during simplification, rebuilt from a dump, defaults).
+    ///
+    /// IMPORTANT: `step` is provenance metadata, NOT identity — it is deliberately excluded from
+    /// `PartialEq`/`Eq`/`Hash` (hand-written below) so structural equality, dedup, and interning are
+    /// unchanged. Two structurally-equal nodes remain equal even if produced at different steps.
+    pub step: Option<u64>,
 }
 
 impl Default for WrappedOpcode {
@@ -196,7 +239,23 @@ impl Default for WrappedOpcode {
         WrappedOpcode {
             opcode: Opcode { code: 0, name: "unknown", mingas: 0, inputs: 0, outputs: 0 },
             inputs: Vec::new(),
+            step: None,
         }
+    }
+}
+
+// `step` is provenance-only and MUST NOT participate in equality/hashing (see field docs): identity is
+// purely structural (`opcode` + `inputs`), preserving all dedup/interning semantics.
+impl PartialEq for WrappedOpcode {
+    fn eq(&self, other: &Self) -> bool {
+        self.opcode == other.opcode && self.inputs == other.inputs
+    }
+}
+impl Eq for WrappedOpcode {}
+impl std::hash::Hash for WrappedOpcode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.opcode.hash(state);
+        self.inputs.hash(state);
     }
 }
 
@@ -212,6 +271,51 @@ impl WrappedOpcode {
     pub fn depth(&self) -> u32 {
         self.inputs.iter().map(|x| x.depth()).max().unwrap_or(0) + 1
     }
+
+    /// Returns `true` if this opcode expression evaluates to an input-independent constant, i.e. it
+    /// is built solely from PUSH literals combined with pure arithmetic/bitwise/comparison opcodes.
+    ///
+    /// Any opcode that reads calldata, storage, memory, the environment, or otherwise depends on
+    /// runtime state (CALLDATALOAD, SLOAD, MLOAD, KECCAK256, CALLER, ADDMOD/MULMOD, CALL*, …) makes
+    /// the expression non-constant. This mirrors the pure-opcode allow-list used by mamori's
+    /// `try_evaluate_constant_op`, and lets the CFG builder treat a JUMPI condition as statically
+    /// determined when it folds to a constant.
+    pub fn is_constant(&self) -> bool {
+        let pure = matches!(
+            self.opcode.code,
+            // PUSH0..=PUSH32
+            0x5F..=0x7F
+            // Binary arithmetic
+            | 0x01 // ADD
+            | 0x03 // SUB
+            | 0x02 // MUL
+            | 0x04 // DIV
+            | 0x06 // MOD
+            | 0x05 // SDIV
+            | 0x07 // SMOD
+            | 0x0a // EXP
+            // Comparison
+            | 0x10 // LT
+            | 0x11 // GT
+            | 0x12 // SLT
+            | 0x13 // SGT
+            | 0x14 // EQ
+            | 0x15 // ISZERO
+            // Bitwise
+            | 0x16 // AND
+            | 0x17 // OR
+            | 0x18 // XOR
+            | 0x19 // NOT
+            // Shifts
+            | 0x1b // SHL
+            | 0x1c // SHR
+            | 0x1d // SAR
+            // Byte / sign-extend
+            | 0x1a // BYTE
+            | 0x0b // SIGNEXTEND
+        );
+        pure && self.inputs.iter().all(|input| input.is_constant())
+    }
 }
 
 impl WrappedInput {
@@ -224,13 +328,33 @@ impl WrappedInput {
     /// let opcode = WrappedOpcode::new(0x01, vec![WrappedInput::Raw(1.into()), WrappedInput::Raw(2.into())]);
     /// assert_eq!(opcode.depth(), 1);
     ///
-    /// let input = WrappedInput::Opcode(opcode);
+    /// let input = WrappedInput::Opcode(std::sync::Arc::new(opcode));
     /// assert_eq!(input.depth(), 1);
     /// ```
     pub fn depth(&self) -> u32 {
         match self {
             WrappedInput::Raw(_) => 0,
             WrappedInput::Opcode(opcode) => opcode.depth(),
+            // Max depth across the writes that produced the read bytes.
+            WrappedInput::MemorySlice(segments) => {
+                segments.iter().map(|s| s.op.depth()).max().unwrap_or(0)
+            }
+            // A concrete keccak result is a leaf value.
+            WrappedInput::KeccakResult(_) => 0,
+        }
+    }
+
+    /// Returns `true` if this input is an input-independent constant. A raw value is always
+    /// constant; a wrapped opcode is constant iff [`WrappedOpcode::is_constant`] holds.
+    pub fn is_constant(&self) -> bool {
+        match self {
+            WrappedInput::Raw(_) => true,
+            WrappedInput::Opcode(opcode) => opcode.is_constant(),
+            // A memory read depends on runtime state (what was written there), never constant.
+            WrappedInput::MemorySlice(_) => false,
+            // A concrete keccak result is a fixed value (SHA3 itself is never in the pure allow-list,
+            // so this does not make a SHA3 expression fold to a constant).
+            WrappedInput::KeccakResult(_) => true,
         }
     }
 }
@@ -250,7 +374,17 @@ impl Display for WrappedInput {
     fn fmt(&self, f: &mut Formatter) -> Result {
         match self {
             WrappedInput::Raw(u256) => write!(f, "{u256}"),
-            WrappedInput::Opcode(opcode) => write!(f, "{opcode}"),
+            WrappedInput::Opcode(opcode) => write!(f, "{}", opcode.as_ref()),
+            WrappedInput::MemorySlice(segments) => write!(
+                f,
+                "mslice[{}]",
+                segments
+                    .iter()
+                    .map(|s| format!("{:#x}..{:#x}={}", s.start, s.end, s.op))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            WrappedInput::KeccakResult(v) => write!(f, "kresult[{v:#x}]"),
         }
     }
 }
@@ -259,6 +393,7 @@ impl Display for WrappedInput {
 mod tests {
     use crate::core::opcodes::Opcode;
     use ethers::types::U256;
+    use std::sync::Arc;
 
     use crate::core::opcodes::{WrappedInput, WrappedOpcode};
 
@@ -286,7 +421,59 @@ mod tests {
 
         // wraps a CALLDATALOAD operation
         let calldataload_wrapped =
-            WrappedOpcode::new(0x35, vec![WrappedInput::Opcode(add_operation_wrapped)]);
+            WrappedOpcode::new(0x35, vec![WrappedInput::Opcode(Arc::new(add_operation_wrapped))]);
         println!("{}", calldataload_wrapped);
+    }
+
+    #[test]
+    fn test_is_constant_raw_and_push() {
+        // a raw value is always constant
+        assert!(WrappedInput::Raw(U256::from(42u8)).is_constant());
+
+        // PUSH1 0x01 -> constant
+        let push = WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))]);
+        assert!(push.is_constant());
+        assert!(WrappedInput::Opcode(Arc::new(push)).is_constant());
+    }
+
+    #[test]
+    fn test_is_constant_pure_arithmetic_tree() {
+        // ISZERO(EQ(PUSH1 1, PUSH1 1)) -> fully constant
+        let eq = WrappedOpcode::new(
+            0x14, // EQ
+            vec![
+                WrappedInput::Opcode(Arc::new(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))]))),
+                WrappedInput::Opcode(Arc::new(WrappedOpcode::new(0x60, vec![WrappedInput::Raw(U256::from(1u8))]))),
+            ],
+        );
+        let iszero = WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(Arc::new(eq))]);
+        assert!(iszero.is_constant());
+    }
+
+    #[test]
+    fn test_is_constant_state_dependent_is_not_constant() {
+        // CALLDATALOAD(PUSH1 0) -> not constant (reads input)
+        let calldataload = WrappedOpcode::new(
+            0x35,
+            vec![WrappedInput::Opcode(Arc::new(WrappedOpcode::new(0x5f, vec![])))],
+        );
+        assert!(!calldataload.is_constant());
+
+        // ISZERO(CALLDATALOAD(..)) -> the impure leaf taints the whole tree
+        let iszero =
+            WrappedOpcode::new(0x15, vec![WrappedInput::Opcode(Arc::new(calldataload))]);
+        assert!(!iszero.is_constant());
+
+        // SLOAD and ADDMOD are also impure for our purposes
+        assert!(!WrappedOpcode::new(0x54, vec![WrappedInput::Raw(U256::zero())]).is_constant());
+        assert!(!WrappedOpcode::new(
+            0x08, // ADDMOD
+            vec![
+                WrappedInput::Raw(U256::from(1u8)),
+                WrappedInput::Raw(U256::from(2u8)),
+                WrappedInput::Raw(U256::from(3u8)),
+            ]
+        )
+        .is_constant());
     }
 }

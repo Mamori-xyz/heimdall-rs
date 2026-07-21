@@ -31,6 +31,14 @@ impl WrappedInput {
             WrappedInput::Opcode(opcode) => {
                 solidified_wrapped_input.push_str(&opcode.yulify());
             }
+            // Yul has no memory-provenance form; render the (first) producing write op.
+            WrappedInput::MemorySlice(segments) => {
+                if let Some(first) = segments.first() {
+                    solidified_wrapped_input.push_str(&first.op.yulify());
+                }
+            }
+            // A keccak result is an internal annotation, not a source-level operand: render nothing.
+            WrappedInput::KeccakResult(_) => {}
         }
 
         solidified_wrapped_input
@@ -70,7 +78,7 @@ mod tests {
         );
         let complex_add_operation = WrappedOpcode::new(
             0x01,
-            vec![WrappedInput::Opcode(add_operation_wrapped), WrappedInput::Raw(U256::from(3u8))],
+            vec![WrappedInput::Opcode(std::sync::Arc::new(add_operation_wrapped)), WrappedInput::Raw(U256::from(3u8))],
         );
         assert_eq!(complex_add_operation.yulify(), "add(add(0x01, 0x02), 0x03)");
     }

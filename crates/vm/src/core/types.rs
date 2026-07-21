@@ -93,6 +93,10 @@ pub fn convert_bitmask(instruction: &Instruction) -> (usize, Vec<String>) {
     for (i, input) in mask.inputs.iter().enumerate() {
         match input {
             WrappedInput::Raw(_) => continue,
+            // Memory-read provenance is not a bitmask operand.
+            WrappedInput::MemorySlice(_) => continue,
+            // A concrete keccak result is not a bitmask operand.
+            WrappedInput::KeccakResult(_) => continue,
             WrappedInput::Opcode(opcode) => {
                 if !(opcode.opcode.name == "CALLDATALOAD" || opcode.opcode.name == "CALLDATACOPY") {
                     if mask.opcode.name == "AND" {

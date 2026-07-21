@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fmt::Display,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use ethers::prelude::U256;
@@ -13,7 +14,7 @@ use super::opcodes::WrappedOpcode;
 /// It is a LIFO data structure that holds a VecDeque of [`StackFrame`]s.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Stack {
-    pub stack: VecDeque<StackFrame>,
+    pub stack: VecDeque<Arc<StackFrame>>,
 }
 
 /// The [`StackFrame`] struct represents a single frame on the stack.
@@ -57,7 +58,7 @@ impl Stack {
     /// assert_eq!(stack.size(), 1);
     /// ```
     pub fn push(&mut self, value: U256, operation: WrappedOpcode) {
-        self.stack.push_front(StackFrame { value, operation });
+        self.stack.push_front(Arc::new(StackFrame { value, operation }));
     }
 
     /// Pop a value off the stack.
@@ -73,7 +74,7 @@ impl Stack {
     /// let frame = stack.pop();
     /// assert_eq!(frame.unwrap().value, U256::from(0x00));
     /// ```
-    pub fn pop(&mut self) -> Result<StackFrame> {
+    pub fn pop(&mut self) -> Result<Arc<StackFrame>> {
         self.stack.pop_front().ok_or_eyre("stack underflow")
     }
 
@@ -100,8 +101,8 @@ impl Stack {
     ///
     /// // stack is now []
     /// ```
-    pub fn pop_n(&mut self, n: usize) -> Vec<StackFrame> {
-        self.stack.drain(0..n).collect::<Vec<StackFrame>>()
+    pub fn pop_n(&mut self, n: usize) -> Vec<Arc<StackFrame>> {
+        self.stack.drain(0..n).collect::<Vec<Arc<StackFrame>>>()
     }
 
     /// Swap the top value and the nth value on the stack.
@@ -170,10 +171,10 @@ impl Stack {
     /// // stack is now [0x00]
     /// assert_eq!(stack.peek(0).value, U256::from(0x00));
     /// ```
-    pub fn peek(&self, index: usize) -> StackFrame {
+    pub fn peek(&self, index: usize) -> Arc<StackFrame> {
         match self.stack.get(index) {
             Some(value) => value.to_owned(),
-            None => StackFrame { value: U256::from(0u8), operation: WrappedOpcode::default() },
+            None => Arc::new(StackFrame { value: U256::from(0u8), operation: WrappedOpcode::default() }),
         }
     }
 
@@ -200,7 +201,7 @@ impl Stack {
     ///
     /// // stack is now []
     /// ```
-    pub fn peek_n(&self, n: usize) -> Vec<StackFrame> {
+    pub fn peek_n(&self, n: usize) -> Vec<Arc<StackFrame>> {
         let mut values = Vec::new();
         for i in 0..n {
             values.push(self.peek(i));

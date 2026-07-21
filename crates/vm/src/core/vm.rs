@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     ops::{Div, Rem, Shl, Shr},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -33,8 +34,8 @@ use super::{
 #[derive(Clone, Debug)]
 pub struct VM {
     pub stack: Stack,
-    pub memory: Memory,
-    pub storage: Storage,
+    pub memory: Arc<Memory>,
+    pub storage: Arc<Storage>,
     pub instruction: u128,
     pub bytecode: Vec<u8>,
     pub calldata: Vec<u8>,
@@ -44,10 +45,15 @@ pub struct VM {
     pub value: u128,
     pub gas_remaining: u128,
     pub gas_used: u128,
-    pub events: Vec<Log>,
+    pub events: Arc<Vec<Log>>,
     pub returndata: Vec<u8>,
     pub exitcode: u128,
     pub address_access_set: HashSet<U256>,
+    /// The most recent CALL/STATICCALL's [`WrappedOpcode`], used to tag return-data memory
+    /// (RETURNDATACOPY / inline ret-range) with the originating call so a later read can be
+    /// attributed without replaying the call's segment.
+    #[cfg(feature = "experimental")]
+    pub returndata_source: Option<WrappedOpcode>,
     #[cfg(feature = "step-tracing")]
     pub operation_count: u128,
     #[cfg(feature = "step-tracing")]
@@ -73,9 +79,9 @@ pub struct State {
     pub gas_used: u128,
     pub gas_remaining: u128,
     pub stack: Stack,
-    pub memory: Memory,
-    pub storage: Storage,
-    pub events: Vec<Log>,
+    pub memory: Arc<Memory>,
+    pub storage: Arc<Storage>,
+    pub events: Arc<Vec<Log>>,
 }
 
 /// [`Instruction`] is a single EVM instruction. It is returned by the [`VM::step`] function, and
@@ -90,8 +96,25 @@ pub struct Instruction {
     pub outputs: Vec<U256>,
     pub input_operations: Vec<WrappedOpcode>,
     pub output_operations: Vec<WrappedOpcode>,
+    /// This instruction's own globally-unique execution step id (same value stamped on `operation`
+    /// at execution time). Reliable even for value-less terminators (JUMP/JUMPI/STOP…) whose
+    /// `output_operations` is empty, so downstream provenance can key on it directly.
+    pub step: Option<u64>,
 }
 
+/// A constant-folded stack value: the executing instruction (e.g. `ADD` of two constants) is replaced
+/// by a synthetic `PUSH32(result)`. Stamp it with the folding instruction's step so the constant keeps
+/// (segment, pc) provenance — an unstamped synthetic op severs the step graph (its consumers record
+/// operand step 0, so no lineage/source can ever be resolved for it).
+fn folded_const(result: U256, step: u64) -> WrappedOpcode {
+    let mut op = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)]);
+    op.step = Some(step);
+    op
+}
+
+// Generic util kept for reuse; no longer called now the MLOAD index keeps its full offset expression
+// (it used to gate collapsing the index to Raw(i) when the offset involved an MLOAD).
+#[allow(dead_code)]
 fn contains_opcode_recursive(wrapped_op: &WrappedOpcode, target_opcode: u8) -> bool {
     if wrapped_op.opcode.code == target_opcode {
         return true;
@@ -103,7 +126,17 @@ fn contains_opcode_recursive(wrapped_op: &WrappedOpcode, target_opcode: u8) -> b
                     return true;
                 }
             }
+            // Recurse into memory-read provenance so a round-tripped opcode is still detected.
+            WrappedInput::MemorySlice(segments) => {
+                for seg in segments {
+                    if contains_opcode_recursive(&seg.op, target_opcode) {
+                        return true;
+                    }
+                }
+            }
             WrappedInput::Raw(_) => {
+            }
+            WrappedInput::KeccakResult(_) => {
             }
         }
     }
@@ -139,8 +172,8 @@ impl VM {
     ) -> VM {
         VM {
             stack: Stack::new(),
-            memory: Memory::new(),
-            storage: Storage::new(),
+            memory: Arc::new(Memory::new()),
+            storage: Arc::new(Storage::new()),
             instruction: 1,
             bytecode: bytecode.to_vec(),
             calldata: calldata.to_vec(),
@@ -150,10 +183,12 @@ impl VM {
             value,
             gas_remaining: gas_limit.max(21000) - 21000,
             gas_used: 21000,
-            events: Vec::new(),
+            events: Arc::new(Vec::new()),
             returndata: Vec::new(),
             exitcode: 255,
             address_access_set: HashSet::new(),
+            #[cfg(feature = "experimental")]
+            returndata_source: None,
             #[cfg(feature = "step-tracing")]
             operation_count: 0,
             #[cfg(feature = "step-tracing")]
@@ -254,6 +289,7 @@ impl VM {
                 outputs: Vec::new(),
                 input_operations: Vec::new(),
                 output_operations: Vec::new(),
+                step: None, // sentinel: bytecode-exhausted, no opcode executed (pre-stamp)
             });
         }
 
@@ -283,12 +319,24 @@ impl VM {
         let gas_cost = opcode_details.mingas;
         self.consume_gas(gas_cost.into());
 
-        // convert inputs to WrappedInputs
+        // convert inputs to WrappedInputs. Arc-wrap each operand so the new opcode shares the
+        // operand subtrees by reference instead of deep-copying them (see WrappedInput docs).
         let wrapped_inputs = input_operations
             .iter()
-            .map(|x| WrappedInput::Opcode(x.to_owned()))
+            .map(|x| WrappedInput::Opcode(Arc::new(x.to_owned())))
             .collect::<Vec<WrappedInput>>();
         let mut operation = WrappedOpcode::new(opcode, wrapped_inputs);
+        // Stamp a globally-unique execution step id (provenance; excluded from Eq/Hash). Unique per
+        // executed instruction across the whole CFG exploration — including loop iterations and forked
+        // branches — so any consumer can map a WrappedOpcode node back to the exact (segment, pc) that
+        // produced it, free of the content-address collisions that structural matching suffers.
+        let this_step = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_STEP: AtomicU64 = AtomicU64::new(1);
+            let s = NEXT_STEP.fetch_add(1, Ordering::Relaxed);
+            operation.step = Some(s);
+            s
+        };
 
         // if step-tracing feature is enabled, print the current operation
         #[cfg(feature = "step-tracing")]
@@ -315,6 +363,7 @@ impl VM {
                     outputs: Vec::new(),
                     input_operations,
                     output_operations: Vec::new(),
+                    step: Some(this_step),
                 });
             }
 
@@ -330,7 +379,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -348,7 +397,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -366,7 +415,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -387,7 +436,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&numerator.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&denominator.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -409,7 +458,7 @@ impl VM {
                     (0x5f..=0x7f).contains(&denominator.operation.opcode.code)
                 {
                     simplified_operation =
-                        WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result.into_raw())])
+                        folded_const(result.into_raw(), this_step)
                 }
 
                 self.stack.push(result.into_raw(), simplified_operation);
@@ -430,7 +479,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&modulus.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -452,7 +501,7 @@ impl VM {
                     (0x5f..=0x7f).contains(&modulus.operation.opcode.code)
                 {
                     simplified_operation =
-                        WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result.into_raw())])
+                        folded_const(result.into_raw(), this_step)
                 }
 
                 self.stack.push(result.into_raw(), simplified_operation);
@@ -474,7 +523,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -496,7 +545,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -514,7 +563,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&exponent.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 // consume dynamic gas
@@ -618,7 +667,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -636,7 +685,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -654,7 +703,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -669,7 +718,7 @@ impl VM {
                 // if both inputs are PUSH instructions, simplify the operation
                 let mut simplified_operation = operation;
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -704,7 +753,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -724,7 +773,7 @@ impl VM {
                 if (0x5f..=0x7f).contains(&a.operation.opcode.code) &&
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
-                    simplified_operation = WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result)])
+                    simplified_operation = folded_const(result, this_step)
                 }
 
                 self.stack.push(result, simplified_operation);
@@ -749,7 +798,7 @@ impl VM {
                     (0x5f..=0x7f).contains(&b.operation.opcode.code)
                 {
                     simplified_operation =
-                        WrappedOpcode::new(0x7f, vec![WrappedInput::Raw(result.into_raw())])
+                        folded_const(result.into_raw(), this_step)
                 }
 
                 self.stack.push(result.into_raw(), simplified_operation);
@@ -767,12 +816,33 @@ impl VM {
                 let data = self.memory.read(offset, size);
                 let result = keccak256(data);
 
+                // Attach the concrete result so this SHA3's content-hash identity is distinct per
+                // result: two mapping accesses whose symbolic key expression is identical but whose
+                // runtime key differs (e.g. `m[0]` vs `m[2]`) otherwise share one node id, collapsing
+                // the recorded slot to whichever ran first. Appended LAST, so preimage-reading code and
+                // rendering are unchanged. Experimental-only.
+                #[allow(unused_mut)]
+                let mut simplified_operation = operation;
+                #[cfg(feature = "experimental")]
+                {
+                    // Attach the write-provenance of the hashed bytes `[offset, offset+size)` so the
+                    // preimage keys (e.g. a mapping key MSTORE'd into scratch) are recoverable
+                    // structurally — the SHA3's own inputs are only `[offset, size]`, never the content.
+                    // Mirrors the MLOAD MemorySlice encoding; lets a downstream `SLOAD(SHA3(..))` resolve
+                    // its keccak slot's index variables without the memory overlay.
+                    let segments = self.memory.bytes.segments_in_range(offset, size);
+                    if !segments.is_empty() {
+                        simplified_operation.inputs.push(WrappedInput::MemorySlice(segments));
+                    }
+                    simplified_operation.inputs.push(WrappedInput::KeccakResult(U256::from(result)));
+                }
+
                 // consume dynamic gas
                 let minimum_word_size = ((size.saturating_add(31)) / 32) as u128;
                 let gas_cost = 6_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.stack.push(U256::from(result), operation);
+                self.stack.push(U256::from(result), simplified_operation);
             }
 
             // ADDRESS
@@ -879,7 +949,7 @@ impl VM {
                 let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -921,7 +991,7 @@ impl VM {
                 let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -977,7 +1047,7 @@ impl VM {
                     self.consume_gas(100);
                 }
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -988,6 +1058,16 @@ impl VM {
 
             // RETURNDATASIZE
             0x3D => {
+                // Attach the source CALL (the one whose return data this sizes) as an input, so a
+                // downstream reader can trace the size back to its external call structurally. `solidify`
+                // renders RETURNDATASIZE by opcode name ("ret0.length") and ignores inputs, so the
+                // string path (OLD) is unchanged. Experimental-only.
+                #[allow(unused_mut)]
+                let mut operation = operation;
+                #[cfg(feature = "experimental")]
+                if let Some(call) = self.returndata_source.clone() {
+                    operation.inputs.push(WrappedInput::Opcode(Arc::new(call)));
+                }
                 self.stack.push(U256::from(1u8), operation);
             }
 
@@ -1011,12 +1091,17 @@ impl VM {
                     3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(dest_offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                // Tag the copied region with the originating CALL (not RETURNDATACOPY itself), so a
+                // later reader can attribute it to that external call's return data.
+                #[cfg(feature = "experimental")]
+                let provenance =
+                    self.returndata_source.clone().unwrap_or_else(|| operation.clone());
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
                     #[cfg(feature = "experimental")]
-                    operation,
+                    provenance,
                 );
             }
 
@@ -1067,13 +1152,24 @@ impl VM {
 
                 let result = U256::from(self.memory.read(i_usize, 32).as_slice());
 
-                let simplified_operation = if input_operations.iter()
-                .any(|op| contains_opcode_recursive(op, 0x51)) {
-                    // replace the input operation with the actual offset value
-                    WrappedOpcode::new(0x51, vec![WrappedInput::Raw(i)])
-                } else {
-                    operation
-                };
+                // Index operand (inputs[0]) = the full offset expression, kept as-is (never collapsed to
+                // Raw(i)) so the index's own derivation stays traceable — including when the offset is
+                // itself loaded from memory (a nested MLOAD carrying its own provenance), mirroring how
+                // the value provenance is kept at inputs[1]. `memory[offset]` rendering / inputs[0]
+                // readers are unchanged.
+                #[allow(unused_mut)]
+                let mut simplified_operation = operation;
+
+                // Append value provenance (inputs[1]): the write ops that produced the 32 bytes read at
+                // [i, i+32), so a value MSTORE'd then re-MLOAD'd keeps its lineage instead of decaying to
+                // a bare `memory[offset]`. Experimental-only (depends on the byte tracker).
+                #[cfg(feature = "experimental")]
+                {
+                    let segments = self.memory.bytes.segments_in_range(i_usize, 32);
+                    if !segments.is_empty() {
+                        simplified_operation.inputs.push(WrappedInput::MemorySlice(segments));
+                    }
+                }
 
                 // consume dynamic gas
                 let gas_cost = self.memory.expansion_cost(i_usize, 32);
@@ -1094,7 +1190,7 @@ impl VM {
                 let gas_cost = self.memory.expansion_cost(offset, 32);
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     offset,
                     32,
                     value.encode().as_slice(),
@@ -1115,7 +1211,7 @@ impl VM {
                 let gas_cost = self.memory.expansion_cost(offset, 1);
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     offset,
                     1,
                     &[value.encode()[31]],
@@ -1129,10 +1225,11 @@ impl VM {
                 let key = self.stack.pop()?.value;
 
                 // consume dynamic gas
-                let gas_cost = self.storage.access_cost(key.into());
+                let gas_cost = Arc::make_mut(&mut self.storage).access_cost(key.into());
                 self.consume_gas(gas_cost);
 
-                self.stack.push(U256::from(self.storage.load(key.into())), operation)
+                let value = Arc::make_mut(&mut self.storage).load(key.into());
+                self.stack.push(U256::from(value), operation)
             }
 
             // SSTORE
@@ -1141,10 +1238,10 @@ impl VM {
                 let value = self.stack.pop()?.value;
 
                 // consume dynamic gas
-                let gas_cost = self.storage.storage_cost(key.into(), value.into());
+                let gas_cost = Arc::make_mut(&mut self.storage).storage_cost(key.into(), value.into());
                 self.consume_gas(gas_cost);
 
-                self.storage.store(key.into(), value.into());
+                Arc::make_mut(&mut self.storage).store(key.into(), value.into());
             }
 
             // JUMP
@@ -1171,6 +1268,7 @@ impl VM {
                         outputs: Vec::new(),
                         input_operations,
                         output_operations: Vec::new(),
+                        step: Some(this_step),
                     });
                 } else {
                     self.instruction = pc + 1;
@@ -1204,6 +1302,7 @@ impl VM {
                             outputs: Vec::new(),
                             input_operations,
                             output_operations: Vec::new(),
+                            step: Some(this_step),
                         });
                     } else {
                         self.instruction = pc + 1;
@@ -1217,14 +1316,15 @@ impl VM {
             // TLOAD
             0x5C => {
                 let key = self.stack.pop()?.value;
-                self.stack.push(U256::from(self.storage.tload(key.into())), operation)
+                let value = Arc::make_mut(&mut self.storage).tload(key.into());
+                self.stack.push(U256::from(value), operation)
             }
 
             // TSTORE
             0x5D => {
                 let key = self.stack.pop()?.value;
                 let value = self.stack.pop()?.value;
-                self.storage.tstore(key.into(), value.into());
+                Arc::make_mut(&mut self.storage).tstore(key.into(), value.into());
             }
 
             // MCOPY
@@ -1253,7 +1353,7 @@ impl VM {
                 let gas_cost = 3_u128.saturating_mul(minimum_word_size).saturating_add(self.memory.expansion_cost(offset, size));
                 self.consume_gas(gas_cost);
 
-                self.memory.store_with_opcode(
+                Arc::make_mut(&mut self.memory).store_with_opcode(
                     dest_offset,
                     size,
                     &value,
@@ -1341,14 +1441,12 @@ impl VM {
 
                 // no need for a panic check because the length of events should never be larger
                 // than a u128
-                self.events.push(Log::new(
-                    self.events
-                        .len()
-                        .try_into()
-                        .expect("impossible case: log_index is larger than u128::MAX"),
-                    topics,
-                    &data,
-                ))
+                let log_index = self
+                    .events
+                    .len()
+                    .try_into()
+                    .expect("impossible case: log_index is larger than u128::MAX");
+                Arc::make_mut(&mut self.events).push(Log::new(log_index, topics, &data))
             }
 
             // CREATE
@@ -1360,6 +1458,44 @@ impl VM {
 
             // CALL, CALLCODE
             0xF1 | 0xF2 => {
+                // Provenance-only: tag the inline return-data range with this call and remember it
+                // for a later RETURNDATACOPY. Operands top-first: gas, addr, value, argsOff, argsSize,
+                // retOff, retSize. No bytes are written, so execution / the CFG are unchanged.
+                #[allow(unused_mut)]
+                let mut operation = operation;
+                #[cfg(feature = "experimental")]
+                {
+                    let frames = self.stack.peek_n(7);
+                    // Attach the argument region's write-provenance FIRST so the enriched call op (with
+                    // its args) is what tags the return data and becomes `returndata_source` — a reader
+                    // of the call's success/return-data can then trace the arguments it was given.
+                    let args_range = match (frames.get(3), frames.get(4)) {
+                        (Some(ao), Some(asz)) => {
+                            let off: usize = ao.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = asz.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = args_range {
+                        let segments = self.memory.bytes.segments_in_range(off, sz);
+                        if !segments.is_empty() {
+                            operation.inputs.push(WrappedInput::MemorySlice(segments));
+                        }
+                    }
+                    let ret_range = match (frames.get(5), frames.get(6)) {
+                        (Some(ro), Some(rs)) => {
+                            let off: usize = ro.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = rs.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = ret_range {
+                        Arc::make_mut(&mut self.memory).annotate_opcode(off, sz, operation.clone());
+                    }
+                    self.returndata_source = Some(operation.clone());
+                }
                 let address = self.stack.pop()?.value;
                 self.stack.pop_n(6);
 
@@ -1392,6 +1528,41 @@ impl VM {
 
             // DELEGATECALL, STATICCALL
             0xF4 | 0xFA => {
+                // Provenance-only (see CALL): operands top-first are gas, addr, argsOff, argsSize,
+                // retOff, retSize — so the args range is at indices 2,3 and the return range at 4,5.
+                #[allow(unused_mut)]
+                let mut operation = operation;
+                #[cfg(feature = "experimental")]
+                {
+                    let frames = self.stack.peek_n(6);
+                    // Argument region write-provenance FIRST (see CALL above).
+                    let args_range = match (frames.get(2), frames.get(3)) {
+                        (Some(ao), Some(asz)) => {
+                            let off: usize = ao.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = asz.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = args_range {
+                        let segments = self.memory.bytes.segments_in_range(off, sz);
+                        if !segments.is_empty() {
+                            operation.inputs.push(WrappedInput::MemorySlice(segments));
+                        }
+                    }
+                    let ret_range = match (frames.get(4), frames.get(5)) {
+                        (Some(ro), Some(rs)) => {
+                            let off: usize = ro.value.try_into().unwrap_or(usize::MAX);
+                            let sz: usize = rs.value.try_into().unwrap_or(0);
+                            if sz > 0 && off != usize::MAX { Some((off, sz)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some((off, sz)) = ret_range {
+                        Arc::make_mut(&mut self.memory).annotate_opcode(off, sz, operation.clone());
+                    }
+                    self.returndata_source = Some(operation.clone());
+                }
                 let address = self.stack.pop()?.value;
                 self.stack.pop_n(5);
 
@@ -1469,6 +1640,7 @@ impl VM {
             outputs,
             input_operations,
             output_operations,
+            step: Some(this_step),
         })
     }
 
@@ -1566,11 +1738,11 @@ impl VM {
     /// ```
     pub fn reset(&mut self) {
         self.stack = Stack::new();
-        self.memory = Memory::new();
+        self.memory = Arc::new(Memory::new());
         self.instruction = 1;
         self.gas_remaining = (self.gas_used + self.gas_remaining).max(21000) - 21000;
         self.gas_used = 21000;
-        self.events = Vec::new();
+        self.events = Arc::new(Vec::new());
         self.returndata = Vec::new();
         self.exitcode = 255;
     }
@@ -1608,7 +1780,7 @@ impl VM {
             gas_remaining: self.gas_remaining,
             returndata: self.returndata.to_owned(),
             exitcode: self.exitcode,
-            events: self.events.clone(),
+            events: (*self.events).clone(),
             instruction: self.instruction,
         })
     }
@@ -2148,7 +2320,10 @@ mod tests {
         let first_item = vm.stack.peek(0);
         assert_eq!(first_item.value, U256::from_str("0x0").expect("failed to parse hex"));
         assert_eq!(first_item.operation.opcode.code, 0x51);
-        assert_eq!(first_item.operation.solidify(), "memory[0xa0]");
+        // The concrete offset folds to 0xa0 (asserted on `.value`), but MLOAD now keeps its full
+        // symbolic index expression, so `solidify` renders the derivation `0x20 + memory[0x40]`
+        // rather than the collapsed `0xa0`.
+        assert_eq!(first_item.operation.solidify(), "memory[(0x20 + memory[0x40])]");
         let second_item = vm.stack.peek(1);
         assert_eq!(second_item.value, U256::from_str("0x120").expect("failed to parse hex"));
         assert_eq!(second_item.operation.opcode.code, 0x51);
