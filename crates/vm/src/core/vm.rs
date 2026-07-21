@@ -2321,8 +2321,8 @@ mod tests {
         assert_eq!(first_item.value, U256::from_str("0x0").expect("failed to parse hex"));
         assert_eq!(first_item.operation.opcode.code, 0x51);
         // The concrete offset folds to 0xa0 (asserted on `.value`), but MLOAD now keeps its full
-        // symbolic index expression (see the `0b07ce0 keep the full MLOAD index expression` change),
-        // so `solidify` renders the derivation `0x20 + memory[0x40]` rather than the collapsed `0xa0`.
+        // symbolic index expression, so `solidify` renders the derivation `0x20 + memory[0x40]`
+        // rather than the collapsed `0xa0`.
         assert_eq!(first_item.operation.solidify(), "memory[(0x20 + memory[0x40])]");
         let second_item = vm.stack.peek(1);
         assert_eq!(second_item.value, U256::from_str("0x120").expect("failed to parse hex"));
