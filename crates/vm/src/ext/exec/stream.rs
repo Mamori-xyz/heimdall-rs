@@ -1101,7 +1101,7 @@ mod tests {
                     InputRef::Op(child) => WrappedInput::Opcode(Arc::new(self.rebuild(*child))),
                     InputRef::MemorySlice(segs) => WrappedInput::MemorySlice(
                         segs.iter()
-                            .map(|(s, e, child)| crate::core::opcodes::MemorySegment {
+                            .map(|(s, e, child, _step)| crate::core::opcodes::MemorySegment {
                                 start: *s as usize,
                                 end: *e as usize,
                                 op: Arc::new(self.rebuild(*child)),
