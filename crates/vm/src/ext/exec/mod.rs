@@ -3,7 +3,8 @@ mod stream;
 mod util;
 
 pub use stream::{
-    BranchKind, ChildEdge, InputRef, StreamSegment, StreamStep, StreamSummary, TraceSink,
+    content_id, content_id_with_sink, BranchKind, ChildEdge, ContentIdMemo, InputRef,
+    StreamOptions, StreamSegment, StreamStep, StreamSummary, TraceSink,
 };
 
 use std::{cell::RefCell, sync::Arc};
