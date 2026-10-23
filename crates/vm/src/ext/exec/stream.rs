@@ -308,6 +308,17 @@ pub fn content_id(op: &WrappedOpcode, memo: &mut ContentIdMemo) -> U256 {
     memo.interner.intern_opcode(&mut NullSink, op)
 }
 
+/// [`content_id`], also streaming every expression-tree node that `memo` has not seen yet through
+/// [`TraceSink::intern_opcode`] (children before parents, as in a full walk). A consumer that
+/// persists trees by content id uses this to collect the records a segment references.
+pub fn content_id_with_sink<S: TraceSink>(
+    op: &WrappedOpcode,
+    memo: &mut ContentIdMemo,
+    sink: &mut S,
+) -> U256 {
+    memo.interner.intern_opcode(sink, op)
+}
+
 /// Content-hash interner. Produces order-independent `U256` ids and emits each value through the
 /// sink exactly once. Within a single run it memoizes by `Arc` pointer identity so the common case
 /// (the same shared `Arc` reappearing across steps) skips re-hashing — this is what preserves the
@@ -1594,6 +1605,41 @@ mod tests {
             assert_eq!(ext.segments[0].segment_hash, child.chained_hash);
             assert_eq!(ext.segments[0].parent_hash, None);
             assert!(ext.steps.is_empty());
+        }
+    }
+
+    #[test]
+    fn content_id_with_sink_emits_rebuildable_trees() {
+        // Trees collected through the sink rebuild to the same expression, children first.
+        let walk = stream_with(&CMP_JUMPI, None, true);
+        let mut collected = CollectingSink::default();
+        let mut checked = 0;
+        for (_, trace) in &walk.traces {
+            let mut memo = ContentIdMemo::default();
+            for state in &trace.operations {
+                for op in state
+                    .last_instruction
+                    .input_operations
+                    .iter()
+                    .chain(state.last_instruction.output_operations.iter())
+                {
+                    let id = content_id_with_sink(op, &mut memo, &mut collected);
+                    assert_eq!(id, content_id(op, &mut ContentIdMemo::default()));
+                    assert_eq!(collected.rebuild(id).solidify(), op.solidify());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10, "too few trees checked ({checked})");
+        // Every child id was emitted before its parent.
+        let pos: HashMap<U256, usize> =
+            collected.opcode_emit_order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        for (id, (_, inputs)) in &collected.opcodes {
+            for r in inputs {
+                if let InputRef::Op(child) = r {
+                    assert!(pos[child] < pos[id], "child emitted after parent");
+                }
+            }
         }
     }
 }
