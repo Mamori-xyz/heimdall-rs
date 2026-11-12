@@ -256,6 +256,11 @@ pub trait TraceSink {
     fn on_step(&mut self, _step: &StreamStep) {}
     /// A finished segment.
     fn on_segment(&mut self, _segment: &StreamSegment) {}
+    /// The same finished segment, with its live [`VMTrace`] (all per-step [`State`]s, including the
+    /// `WrappedOpcode` expression trees). Called right after [`Self::on_segment`], before the trace
+    /// is dropped, so a consumer can convert the segment in place instead of rebuilding it from
+    /// interned records. `trace.children` is always empty.
+    fn on_segment_trace(&mut self, _segment: &StreamSegment, _trace: &VMTrace) {}
     /// Provenance for a ROUTE-PREFIX instruction replayed to set up VM state during an extend but NOT
     /// streamed as a full step/segment (see [`VM::build_trace_start_from_route_chained`]). Such an
     /// instruction gets a fresh unique `step` id and its value can be carried on the stack into the
@@ -273,6 +278,45 @@ pub trait TraceSink {
         _input_steps: &[u64],
     ) {
     }
+}
+
+/// Options for [`VM::stream_all_traces_with`] / [`VM::stream_all_traces_selector_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamOptions {
+    /// Skip per-step interning: no `intern_*` and no `on_step` calls, only `on_segment` and
+    /// `on_segment_trace`. The interner pins an `Arc` of every distinct opcode tree, stack frame,
+    /// memory and storage image it sees for the whole walk; a lean walk keeps nothing across
+    /// segments, so its memory is just the BFS frontier and the loop-detection maps.
+    pub lean: bool,
+}
+
+/// Memo for [`content_id`]. It pins the `Arc`s it has hashed (see [`Interner`]), so keep one per
+/// segment (or per batch of lookups) and drop it, rather than holding it for a whole walk.
+#[derive(Default)]
+pub struct ContentIdMemo {
+    interner: Interner,
+}
+
+/// Sink that ignores everything; lets [`content_id`] reuse the interner's exact hashing path.
+struct NullSink;
+impl TraceSink for NullSink {}
+
+/// Content id of a `WrappedOpcode`: the same id the streaming interner assigns to it (and that
+/// appears in `StreamStep::input_ops`/`output_ops` and in dumps). Deterministic across runs, so it
+/// links an expression seen in one walk to the same expression persisted from an earlier walk.
+pub fn content_id(op: &WrappedOpcode, memo: &mut ContentIdMemo) -> U256 {
+    memo.interner.intern_opcode(&mut NullSink, op)
+}
+
+/// [`content_id`], also streaming every expression-tree node that `memo` has not seen yet through
+/// [`TraceSink::intern_opcode`] (children before parents, as in a full walk). A consumer that
+/// persists trees by content id uses this to collect the records a segment references.
+pub fn content_id_with_sink<S: TraceSink>(
+    op: &WrappedOpcode,
+    memo: &mut ContentIdMemo,
+    sink: &mut S,
+) -> U256 {
+    memo.interner.intern_opcode(sink, op)
 }
 
 /// Content-hash interner. Produces order-independent `U256` ids and emits each value through the
@@ -634,6 +678,7 @@ fn emit_node<S: TraceSink>(
     this_loop_hash: U256,
     trace: &VMTrace,
     next_vms: Vec<VM>,
+    lean: bool,
 ) -> Result<Vec<(U256, VM)>> {
     let first_pc = trace
         .operations
@@ -648,9 +693,11 @@ fn emit_node<S: TraceSink>(
         .clone();
     let step_count = trace.operations.len() as u32;
 
-    for (i, state) in trace.operations.iter().enumerate() {
-        let step = interner.step_record(sink, this_id, i as u32, state);
-        sink.on_step(&step);
+    if !lean {
+        for (i, state) in trace.operations.iter().enumerate() {
+            let step = interner.step_record(sink, this_id, i as u32, state);
+            sink.on_step(&step);
+        }
     }
 
     let mut children = Vec::with_capacity(next_vms.len());
@@ -663,7 +710,7 @@ fn emit_node<S: TraceSink>(
         enqueue.push((child_id, child_vm));
     }
 
-    sink.on_segment(&StreamSegment {
+    let segment = StreamSegment {
         segment_hash: this_id,
         parent_hash: parent_id,
         children,
@@ -673,7 +720,9 @@ fn emit_node<S: TraceSink>(
         end_pc: last.instruction,
         step_count,
         static_jumpi: static_jumpi_of_trace(trace),
-    });
+    };
+    sink.on_segment(&segment);
+    sink.on_segment_trace(&segment, trace);
 
     Ok(enqueue)
 }
@@ -694,6 +743,35 @@ impl VM {
         processed_nodes: &mut HashSet<U256>,
         sink: &mut S,
     ) -> Result<Option<StreamSummary>> {
+        self.stream_all_traces_selector_with(
+            selector,
+            entry_point,
+            branch_limit,
+            segment_limit,
+            loop_limit,
+            simple_cfg,
+            route,
+            processed_nodes,
+            StreamOptions::default(),
+            sink,
+        )
+    }
+
+    /// [`VM::stream_all_traces_selector`] with explicit [`StreamOptions`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_all_traces_selector_with<S: TraceSink>(
+        &mut self,
+        selector: &str,
+        entry_point: u128,
+        branch_limit: Option<u32>,
+        segment_limit: Option<u32>,
+        loop_limit: Option<u32>,
+        simple_cfg: bool,
+        route: Option<Vec<(usize, usize)>>,
+        processed_nodes: &mut HashSet<U256>,
+        options: StreamOptions,
+        sink: &mut S,
+    ) -> Result<Option<StreamSummary>> {
         self.calldata = decode_hex(selector)?;
 
         while self.bytecode.len() >= self.instruction as usize && (self.instruction <= entry_point) {
@@ -703,13 +781,14 @@ impl VM {
             }
         }
 
-        self.stream_all_traces(
+        self.stream_all_traces_with(
             branch_limit,
             segment_limit,
             loop_limit,
             simple_cfg,
             route,
             processed_nodes,
+            options,
             sink,
         )
     }
@@ -735,6 +814,32 @@ impl VM {
         simple_cfg: bool,
         route: Option<Vec<(usize, usize)>>,
         processed_nodes: &mut HashSet<U256>,
+        sink: &mut S,
+    ) -> Result<Option<StreamSummary>> {
+        self.stream_all_traces_with(
+            branch_limit,
+            segment_limit,
+            loop_limit,
+            simple_cfg,
+            route,
+            processed_nodes,
+            StreamOptions::default(),
+            sink,
+        )
+    }
+
+    /// [`VM::stream_all_traces`] with explicit [`StreamOptions`]. With `options.lean` the walk,
+    /// ids, limits and segment records are identical; only the per-step interning is skipped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_all_traces_with<S: TraceSink>(
+        &mut self,
+        branch_limit: Option<u32>,
+        segment_limit: Option<u32>,
+        loop_limit: Option<u32>,
+        simple_cfg: bool,
+        route: Option<Vec<(usize, usize)>>,
+        processed_nodes: &mut HashSet<U256>,
+        options: StreamOptions,
         sink: &mut S,
     ) -> Result<Option<StreamSummary>> {
         let mut branch_count: u32 = 0;
@@ -781,6 +886,7 @@ impl VM {
             root_loop_hash,
             &root_trace,
             root_next_vms,
+            options.lean,
         )?;
 
         let mut queue: VecDeque<(U256, U256, HashMap<U256, u32>, VM)> = VecDeque::new();
@@ -850,6 +956,7 @@ impl VM {
                 current_trace_hash,
                 &trace,
                 next_vms,
+                options.lean,
             )?;
 
             if !skip_children {
@@ -1342,5 +1449,197 @@ mod tests {
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].branch_kind, BranchKind::Continue);
         assert!(root.static_jumpi.is_some());
+    }
+
+    /// Records full steps, segments and the live per-segment traces (`on_segment_trace`).
+    #[derive(Default)]
+    struct TraceCapturingSink {
+        steps: Vec<StreamStep>,
+        segments: Vec<StreamSegment>,
+        traces: Vec<(U256, VMTrace)>,
+        interned_opcodes: usize,
+    }
+
+    impl TraceSink for TraceCapturingSink {
+        fn intern_opcode(&mut self, _id: U256, _code: u8, _inputs: &[InputRef]) {
+            self.interned_opcodes += 1;
+        }
+        fn on_step(&mut self, step: &StreamStep) {
+            self.steps.push(step.clone());
+        }
+        fn on_segment(&mut self, segment: &StreamSegment) {
+            self.segments.push(segment.clone());
+        }
+        fn on_segment_trace(&mut self, segment: &StreamSegment, trace: &VMTrace) {
+            self.traces.push((segment.segment_hash, trace.clone()));
+        }
+    }
+
+    fn stream_with(
+        bytecode: &[u8],
+        route: Option<Vec<(usize, usize)>>,
+        lean: bool,
+    ) -> TraceCapturingSink {
+        let mut vm = new_vm(bytecode);
+        let mut sink = TraceCapturingSink::default();
+        vm.stream_all_traces_with(
+            None,
+            None,
+            Some(2),
+            false,
+            route,
+            &mut HashSet::new(),
+            StreamOptions { lean },
+            &mut sink,
+        )
+        .expect("stream_all_traces_with failed")
+        .expect("expected a summary");
+        sink
+    }
+
+    // PUSH1 4; CALLDATALOAD; PUSH1 1; ADD; PUSH1 0; MSTORE; PUSH1 0x20; PUSH1 0; SHA3; PUSH1 5; LT;
+    // PUSH1 0x15; JUMPI; STOP; JUMPDEST; STOP — arithmetic, a memory round-trip into SHA3 (a
+    // MemorySlice operand) and a comparison feeding a dynamic JUMPI.
+    const CMP_JUMPI: [u8; 23] = [
+        0x60, 0x04, 0x35, 0x60, 0x01, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0x20, 0x60,
+        0x05, 0x10, 0x60, 0x15, 0x57, 0x00, 0x5b, 0x00,
+    ];
+
+    // JUMPDEST; PUSH1 0; JUMP — an unconditional self-loop (bounded by loop_limit).
+    const SELF_LOOP: [u8; 4] = [0x5b, 0x60, 0x00, 0x56];
+
+    #[test]
+    fn lean_walk_emits_identical_segments_without_steps() {
+        for bytecode in [&DYNAMIC_JUMPI[..], &CMP_JUMPI[..], &SELF_LOOP[..]] {
+            let full = stream_with(bytecode, None, false);
+            let lean = stream_with(bytecode, None, true);
+            assert_eq!(full.segments, lean.segments, "lean changed the segment records");
+            assert!(!full.steps.is_empty());
+            assert!(lean.steps.is_empty(), "lean walk must not emit on_step");
+            assert_eq!(lean.interned_opcodes, 0, "lean walk must not intern");
+        }
+    }
+
+    #[test]
+    fn on_segment_trace_follows_each_segment() {
+        for lean in [false, true] {
+            let sink = stream_with(&CMP_JUMPI, None, lean);
+            let seg_ids: Vec<U256> = sink.segments.iter().map(|s| s.segment_hash).collect();
+            let trace_ids: Vec<U256> = sink.traces.iter().map(|(id, _)| *id).collect();
+            assert_eq!(seg_ids, trace_ids, "one on_segment_trace per segment, same order");
+            for (seg, (_, trace)) in sink.segments.iter().zip(&sink.traces) {
+                assert_eq!(trace.operations.len() as u32, seg.step_count);
+                assert!(trace.children.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn content_id_matches_interned_ids() {
+        let sink = stream_with(&CMP_JUMPI, None, false);
+        let mut checked = 0;
+        for (seg_id, trace) in &sink.traces {
+            // One memo per segment, as a consumer would use it.
+            let mut memo = ContentIdMemo::default();
+            for (i, state) in trace.operations.iter().enumerate() {
+                let step = sink
+                    .steps
+                    .iter()
+                    .find(|s| s.segment_hash == *seg_id && s.step_index == i as u32)
+                    .expect("step not streamed");
+                let ins: Vec<U256> = state
+                    .last_instruction
+                    .input_operations
+                    .iter()
+                    .map(|op| content_id(op, &mut memo))
+                    .collect();
+                let outs: Vec<U256> = state
+                    .last_instruction
+                    .output_operations
+                    .iter()
+                    .map(|op| content_id(op, &mut memo))
+                    .collect();
+                assert_eq!(ins, step.input_operation_ids, "input ids differ at step {i}");
+                assert_eq!(outs, step.output_operation_ids, "output ids differ at step {i}");
+                checked += ins.len() + outs.len();
+            }
+        }
+        assert!(checked > 10, "too few operations compared ({checked})");
+    }
+
+    #[test]
+    fn content_id_is_stable_across_walks_and_memos() {
+        // The same expression from two independent walks (fresh VMs, fresh memos) gets the same id.
+        let a = stream_with(&CMP_JUMPI, None, true);
+        let b = stream_with(&CMP_JUMPI, None, true);
+        let ids = |sink: &TraceCapturingSink| -> Vec<U256> {
+            let mut out = Vec::new();
+            for (_, trace) in &sink.traces {
+                let mut memo = ContentIdMemo::default();
+                for state in &trace.operations {
+                    for op in &state.last_instruction.output_operations {
+                        out.push(content_id(op, &mut memo));
+                    }
+                }
+            }
+            out
+        };
+        assert_eq!(ids(&a), ids(&b));
+    }
+
+    #[test]
+    fn lean_extend_reproduces_full_walk_ids() {
+        let full = stream_with(&DYNAMIC_JUMPI, None, true);
+        let root = &full.segments[0];
+        for child in &root.children {
+            let seg = full
+                .segments
+                .iter()
+                .find(|s| s.segment_hash == child.chained_hash)
+                .expect("child segment not emitted");
+            let route = vec![
+                (root.start_pc as usize - 1, root.end_pc as usize - 1),
+                (seg.start_pc as usize - 1, seg.end_pc as usize - 1),
+            ];
+            let ext = stream_with(&DYNAMIC_JUMPI, Some(route), true);
+            assert_eq!(ext.segments[0].segment_hash, child.chained_hash);
+            assert_eq!(ext.segments[0].parent_hash, None);
+            assert!(ext.steps.is_empty());
+        }
+    }
+
+    #[test]
+    fn content_id_with_sink_emits_rebuildable_trees() {
+        // Trees collected through the sink rebuild to the same expression, children first.
+        let walk = stream_with(&CMP_JUMPI, None, true);
+        let mut collected = CollectingSink::default();
+        let mut checked = 0;
+        for (_, trace) in &walk.traces {
+            let mut memo = ContentIdMemo::default();
+            for state in &trace.operations {
+                for op in state
+                    .last_instruction
+                    .input_operations
+                    .iter()
+                    .chain(state.last_instruction.output_operations.iter())
+                {
+                    let id = content_id_with_sink(op, &mut memo, &mut collected);
+                    assert_eq!(id, content_id(op, &mut ContentIdMemo::default()));
+                    assert_eq!(collected.rebuild(id).solidify(), op.solidify());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10, "too few trees checked ({checked})");
+        // Every child id was emitted before its parent.
+        let pos: HashMap<U256, usize> =
+            collected.opcode_emit_order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        for (id, (_, inputs)) in &collected.opcodes {
+            for r in inputs {
+                if let InputRef::Op(child) = r {
+                    assert!(pos[child] < pos[id], "child emitted after parent");
+                }
+            }
+        }
     }
 }
